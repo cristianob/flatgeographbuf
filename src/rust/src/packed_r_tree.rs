@@ -959,11 +959,11 @@ mod tests {
 
     #[test]
     fn tree_100_000_items_in_denmark() -> Result<()> {
-        use rand::distributions::{Distribution, Uniform};
+        use rand::distr::{Distribution, Uniform};
 
-        let unifx = Uniform::from(466379..708929);
-        let unify = Uniform::from(6096801..6322352);
-        let mut rng = rand::thread_rng();
+        let unifx = Uniform::try_from(466379..708929)?;
+        let unify = Uniform::try_from(6096801..6322352)?;
+        let mut rng = rand::rng();
 
         let mut nodes = Vec::new();
         for _ in 0..100000 {

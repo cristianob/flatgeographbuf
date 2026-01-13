@@ -13,15 +13,40 @@
     },
     "files": [
         "lib/**/*",
-        "dist/**/*"
+        "dist/**/*",
+        "!lib/**/*.spec.js",
+        "!lib/**/*.spec.js.map",
+        "!lib/**/*.spec.d.ts"
     ],
     "types": "lib/mjs/flatgeographbuf.d.ts",
     "module": "lib/mjs/flatgeographbuf.js",
     "main": "lib/mjs/flatgeographbuf.js",
     "type": "module",
+    "exports": {
+        ".": {
+            "types": "./lib/mjs/flatgeographbuf.d.ts",
+            "import": "./lib/mjs/flatgeographbuf.js",
+            "default": "./lib/mjs/flatgeographbuf.js"
+        },
+        "./geojson": {
+            "types": "./lib/mjs/geojson.d.ts",
+            "import": "./lib/mjs/geojson.js",
+            "default": "./lib/mjs/geojson.js"
+        },
+        "./generic": {
+            "types": "./lib/mjs/generic.d.ts",
+            "import": "./lib/mjs/generic.js",
+            "default": "./lib/mjs/generic.js"
+        },
+        "./ol": {
+            "types": "./lib/mjs/ol.d.ts",
+            "import": "./lib/mjs/ol.js",
+            "default": "./lib/mjs/ol.js"
+        }
+    },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/flatgeobuf/flatgeographbuf.git"
+        "url": "git+https://github.com/cristianob/flatgeographbuf.git"
     },
     "keywords": [
         "spatial",
@@ -44,9 +69,9 @@
     ],
     "license": "BSD-3-Clause",
     "bugs": {
-        "url": "https://github.com/flatgeobuf/flatgeographbuf/issues"
+        "url": "https://github.com/cristianob/flatgeographbuf/issues"
     },
-    "homepage": "https://github.com/flatgeobuf/flatgeographbuf#readme",
+    "homepage": "https://github.com/cristianob/flatgeographbuf#readme",
     "dependencies": {
         "@repeaterjs/repeater": "3.0.6",
         "flatbuffers": "25.9.23",

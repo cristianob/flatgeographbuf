@@ -6,6 +6,7 @@
 - [Basic Usage](#basic-usage)
 - [Working with Edges](#working-with-edges)
 - [Edge Properties](#edge-properties)
+- [Metadata Callback](#metadata-callback)
 - [Streaming Large Graphs](#streaming-large-graphs)
 - [Integration with Graph Libraries](#integration-with-graph-libraries)
 - [Real-World Examples](#real-world-examples)
@@ -193,12 +194,102 @@ const result = await deserialize(bytes);
 result.adjacencyList.edges.forEach(edge => {
     console.log(`Edge ${edge.from} -> ${edge.to}`);
     
-    if (edge.properties) {
-        console.log(`  Distance: ${edge.properties.distance} km`);
-        console.log(`  Road type: ${edge.properties.road_type}`);
-        console.log(`  Has toll: ${edge.properties.toll}`);
+    // edge.properties is always an object (never undefined)
+    console.log(`  Distance: ${edge.properties.distance} km`);
+    console.log(`  Road type: ${edge.properties.road_type}`);
+    console.log(`  Has toll: ${edge.properties.toll}`);
+});
+```
+
+## Metadata Callback
+
+The `deserialize` function accepts an optional callback that provides metadata about both features and graph edges before the full data is parsed.
+
+### Basic Metadata Usage
+
+```typescript
+import { deserialize } from 'flatgeographbuf/geojson';
+import type { FlatGeoGraphBufMeta } from 'flatgeographbuf/geojson';
+
+const result = await deserialize(bytes, (meta: FlatGeoGraphBufMeta) => {
+    // Feature metadata (nested under 'features')
+    console.log(`Features: ${meta.features.featuresCount}`);
+    console.log(`Geometry type: ${meta.features.geometryType}`);
+    
+    // Feature property schema
+    if (meta.features.columns) {
+        console.log('Feature columns:');
+        meta.features.columns.forEach(col => {
+            console.log(`  ${col.name}: ${col.type}`);
+        });
+    }
+    
+    // Graph metadata (null if no graph section)
+    if (meta.graph) {
+        console.log(`Edges: ${meta.graph.edgeCount}`);
+        
+        // Edge property schema
+        if (meta.graph.edgeColumns) {
+            console.log('Edge columns:');
+            meta.graph.edgeColumns.forEach(col => {
+                console.log(`  ${col.name}: ${col.type}`);
+            });
+        }
     }
 });
+```
+
+### Pre-allocating Arrays Based on Counts
+
+```typescript
+const result = await deserialize(bytes, (meta) => {
+    // Pre-allocate arrays for better performance with large graphs
+    const nodes = new Array(meta.features.featuresCount);
+    const edges = meta.graph ? new Array(meta.graph.edgeCount) : [];
+    
+    console.log(`Will load ${meta.features.featuresCount} nodes and ${meta.graph?.edgeCount ?? 0} edges`);
+});
+```
+
+### Validating Expected Schema
+
+```typescript
+async function loadRoadNetwork(bytes: Uint8Array) {
+    return await deserialize(bytes, (meta) => {
+        // Validate feature schema
+        const hasName = meta.features.columns?.some(c => c.name === 'name');
+        if (!hasName) {
+            throw new Error('Road network must have "name" column on features');
+        }
+        
+        // Validate graph schema
+        if (!meta.graph) {
+            throw new Error('Road network must have graph section');
+        }
+        
+        const hasWeight = meta.graph.edgeColumns?.some(c => c.name === 'weight');
+        if (!hasWeight) {
+            throw new Error('Road network edges must have "weight" column');
+        }
+    });
+}
+```
+
+### Progress Indication
+
+```typescript
+async function loadWithProgress(bytes: Uint8Array) {
+    let totalItems = 0;
+    
+    const result = await deserialize(bytes, (meta) => {
+        totalItems = meta.features.featuresCount + (meta.graph?.edgeCount ?? 0);
+        console.log(`Loading ${totalItems} items...`);
+        showProgressBar(0, totalItems);
+    });
+    
+    showProgressBar(totalItems, totalItems);
+    return result;
+}
 ```
 
 ## Streaming Large Graphs
@@ -657,7 +748,10 @@ import type {
     AdjacencyListInput, 
     Edge, 
     EdgeInput,
-    DeserializeGraphResult 
+    DeserializeGraphResult,
+    FlatGeoGraphBufMeta,
+    FeaturesHeaderMeta,
+    GraphHeaderMeta,
 } from 'flatgeographbuf/geojson';
 
 // EdgeInput - for serialization (properties optional)
@@ -674,6 +768,10 @@ const edgeInput: EdgeInput = {
 const adjacencyListInput: AdjacencyListInput = {
     edges: [edgeInput]
 };
+
+// FlatGeoGraphBufMeta - combined metadata structure
+// meta.features: FeaturesHeaderMeta - feature/vertex metadata
+// meta.graph: GraphHeaderMeta | null - graph/edge metadata (null if no graph)
 
 // Result type - properties always present as object
 async function processGraph(bytes: Uint8Array): Promise<void> {

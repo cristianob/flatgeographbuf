@@ -97,6 +97,30 @@ interface DeserializeGraphResult<T> {
     features: T[];
     adjacencyList: AdjacencyList;
 }
+
+interface FeaturesHeaderMeta {
+    featuresCount: number;
+    columns: ColumnMeta[] | null;
+    geometryType: GeometryType;
+    envelope: Float64Array | null;
+    indexNodeSize: number;
+    crs: CrsMeta | null;
+    title: string | null;
+    description: string | null;
+    metadata: string | null;
+}
+
+interface GraphHeaderMeta {
+    edgeCount: number;
+    edgeColumns: ColumnMeta[] | null;
+}
+
+interface FlatGeoGraphBufMeta {
+    features: FeaturesHeaderMeta;
+    graph: GraphHeaderMeta | null;
+}
+
+type FlatGeoGraphBufMetaFn = (meta: FlatGeoGraphBufMeta) => void;
 ```
 
 ### Functions
@@ -109,12 +133,26 @@ Serialize GeoJSON features and optional graph edges to FlatGeoGraphBuf format.
 - `adjacencyList` - Optional graph edges with properties
 - `crsCode` - Optional CRS code (default: 0)
 
-#### `deserialize(bytes, headerMetaFn?): Promise<DeserializeGraphResult>`
+#### `deserialize(bytes, metaFn?): Promise<DeserializeGraphResult>`
 
 Deserialize FlatGeoGraphBuf to features and adjacency list.
 
 - `bytes` - FlatGeoGraphBuf binary data
-- `headerMetaFn` - Optional callback for header metadata
+- `metaFn` - Optional callback receiving combined feature and graph metadata
+
+```typescript
+await deserialize(bytes, (meta) => {
+    // Feature metadata (nested under 'features')
+    console.log(meta.features.featuresCount);  // number of features
+    console.log(meta.features.columns);        // ColumnMeta[] - feature property schema
+    
+    // Graph metadata (null if no graph section)
+    if (meta.graph) {
+        console.log(meta.graph.edgeCount);     // number of edges
+        console.log(meta.graph.edgeColumns);   // ColumnMeta[] - edge property schema
+    }
+});
+```
 
 #### `deserializeStream(input, rect?, headerMetaFn?): AsyncGenerator<Feature>`
 

@@ -379,6 +379,12 @@ function parseEdge(bytes: Uint8Array, offset: number, size: number, columns: Col
     return { from, to, properties };
 }
 
+export function parseGraphSectionHeader(bytes: Uint8Array, offset: number): GraphHeaderMeta {
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
+    const headerSize = view.getUint32(0, true);
+    return parseGraphHeader(bytes, offset + SIZE_PREFIX_LEN, headerSize);
+}
+
 export function parseGraphSection(bytes: Uint8Array, offset: number): AdjacencyList {
     const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
     const headerSize = view.getUint32(0, true);

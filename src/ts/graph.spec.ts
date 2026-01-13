@@ -388,4 +388,81 @@ describe('FlatGeoGraphBuf', () => {
             expect(edges[1].properties).toEqual({ weight: 1.5 });
         });
     });
+
+    describe('Metadata callback', () => {
+        it('should provide feature and graph metadata via callback', async () => {
+            const geojson: GeoJsonFeatureCollection = {
+                type: 'FeatureCollection',
+                features: [
+                    {
+                        type: 'Feature',
+                        id: 0,
+                        geometry: { type: 'Point', coordinates: [0, 0] },
+                        properties: { name: 'A', value: 100 },
+                    },
+                    {
+                        type: 'Feature',
+                        id: 1,
+                        geometry: { type: 'Point', coordinates: [1, 1] },
+                        properties: { name: 'B', value: 200 },
+                    },
+                ],
+            };
+
+            const adjacencyList = {
+                edges: [{ from: 0, to: 1, properties: { weight: 1.5, label: 'edge-1' } }],
+            };
+
+            const bytes = serialize(geojson, adjacencyList);
+
+            let receivedMeta: any = null;
+            await deserialize(bytes, (meta) => {
+                receivedMeta = meta;
+            });
+
+            expect(receivedMeta).not.toBeNull();
+            expect(receivedMeta.features.featuresCount).toBe(2);
+            expect(receivedMeta.features.columns).toHaveLength(2);
+            expect(receivedMeta.features.columns[0].name).toBe('name');
+            expect(receivedMeta.features.columns[1].name).toBe('value');
+
+            expect(receivedMeta.graph).not.toBeNull();
+            expect(receivedMeta.graph.edgeCount).toBe(1);
+            expect(receivedMeta.graph.edgeColumns).toHaveLength(2);
+            expect(receivedMeta.graph.edgeColumns[0].name).toBe('weight');
+            expect(receivedMeta.graph.edgeColumns[1].name).toBe('label');
+        });
+
+        it('should return null graph metadata when no graph section', async () => {
+            const geojson = makePointCollection(2);
+            const bytes = serialize(geojson);
+
+            let receivedMeta: any = null;
+            await deserialize(bytes, (meta) => {
+                receivedMeta = meta;
+            });
+
+            expect(receivedMeta).not.toBeNull();
+            expect(receivedMeta.features.featuresCount).toBe(2);
+            expect(receivedMeta.graph).toBeNull();
+        });
+
+        it('should return null edgeColumns when edges have no properties', async () => {
+            const geojson = makePointCollection(2);
+            const adjacencyList = {
+                edges: [{ from: 0, to: 1 }],
+            };
+
+            const bytes = serialize(geojson, adjacencyList);
+
+            let receivedMeta: any = null;
+            await deserialize(bytes, (meta) => {
+                receivedMeta = meta;
+            });
+
+            expect(receivedMeta.graph).not.toBeNull();
+            expect(receivedMeta.graph.edgeCount).toBe(1);
+            expect(receivedMeta.graph.edgeColumns).toBeNull();
+        });
+    });
 });

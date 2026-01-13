@@ -8,7 +8,7 @@ import {
     deserializeStream as fcDeserializeStream,
     serialize as fcSerialize,
 } from './geojson/featurecollection.js';
-import type { AdjacencyListInput, DeserializeGraphResult, Edge } from './graph-types.js';
+import type { AdjacencyListInput, DeserializeGraphResult, Edge, FlatGeoGraphBufMetaFn } from './graph-types.js';
 import type { Rect } from './packedrtree.js';
 
 export type {
@@ -18,6 +18,10 @@ export type {
     Edge,
     EdgeInput,
     EdgeProperties,
+    FeaturesHeaderMeta,
+    FlatGeoGraphBufMeta,
+    FlatGeoGraphBufMetaFn,
+    GraphHeaderMeta,
 } from './graph-types.js';
 
 export function serialize(
@@ -30,9 +34,9 @@ export function serialize(
 
 export async function deserialize(
     bytes: Uint8Array,
-    headerMetaFn?: HeaderMetaFn,
+    metaFn?: FlatGeoGraphBufMetaFn,
 ): Promise<DeserializeGraphResult<IGeoJsonFeature>> {
-    return fcDeserialize(bytes, headerMetaFn);
+    return fcDeserialize(bytes, metaFn);
 }
 
 export function deserializeStream(

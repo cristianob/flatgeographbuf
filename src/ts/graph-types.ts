@@ -1,9 +1,7 @@
 import type { ColumnMeta } from './column-meta.js';
+import type { CrsMeta } from './crs-meta.js';
+import type { GeometryType } from './flat-geobuf/geometry-type.js';
 
-/**
- * Properties that can be attached to an edge.
- * Same types as feature properties for consistency.
- */
 export interface EdgeProperties {
     [key: string]: boolean | number | string | Uint8Array | object | null | undefined;
 }
@@ -28,23 +26,31 @@ export interface AdjacencyList {
     edges: Edge[];
 }
 
-/**
- * Metadata for the graph section header.
- * Used internally during serialization/deserialization.
- */
+export interface FeaturesHeaderMeta {
+    geometryType: GeometryType;
+    columns: ColumnMeta[] | null;
+    envelope: Float64Array | null;
+    featuresCount: number;
+    indexNodeSize: number;
+    crs: CrsMeta | null;
+    title: string | null;
+    description: string | null;
+    metadata: string | null;
+}
+
 export interface GraphHeaderMeta {
-    /** Number of edges in the graph */
     edgeCount: number;
-    /** Column definitions for edge properties (like feature columns) */
     edgeColumns: ColumnMeta[] | null;
 }
 
-/**
- * Result from deserializing a FlatGeoGraphBuf file with graph data.
- */
 export interface DeserializeGraphResult<T> {
-    /** Array of deserialized features (vertices) */
     features: T[];
-    /** Adjacency list with edges */
     adjacencyList: AdjacencyList;
 }
+
+export interface FlatGeoGraphBufMeta {
+    features: FeaturesHeaderMeta;
+    graph: GraphHeaderMeta | null;
+}
+
+export type FlatGeoGraphBufMetaFn = (meta: FlatGeoGraphBufMeta) => void;

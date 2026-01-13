@@ -22,8 +22,15 @@ import {
 } from '../generic/featurecollection.js';
 import { inferGeometryType } from '../generic/header.js';
 import type { HeaderMetaFn } from '../generic.js';
-import { buildGraphSection, deserializeGraphStream, parseGraphSection } from '../graph.js';
-import type { AdjacencyList, AdjacencyListInput, DeserializeGraphResult, Edge } from '../graph-types.js';
+import { buildGraphSection, deserializeGraphStream, parseGraphSection, parseGraphSectionHeader } from '../graph.js';
+import type {
+    AdjacencyList,
+    AdjacencyListInput,
+    DeserializeGraphResult,
+    Edge,
+    FlatGeoGraphBufMeta,
+    FlatGeoGraphBufMetaFn,
+} from '../graph-types.js';
 import type { HeaderMeta } from '../header-meta.js';
 import { fromByteBuffer } from '../header-meta.js';
 import { calcTreeSize, type Rect } from '../packedrtree.js';
@@ -117,24 +124,32 @@ function calculateFeaturesEndOffset(bytes: Uint8Array, headerMeta: HeaderMeta): 
 
 export async function deserialize(
     bytes: Uint8Array,
-    headerMetaFn?: HeaderMetaFn,
+    metaFn?: FlatGeoGraphBufMetaFn,
 ): Promise<DeserializeGraphResult<IGeoJsonFeature>> {
     const features: IGeoJsonFeature[] = [];
 
     const bb = new flatbuffers.ByteBuffer(bytes);
     bb.setPosition(magicbytes.length);
     const headerMeta = fromByteBuffer(bb);
-    if (headerMetaFn) headerMetaFn(headerMeta);
+
+    const featuresEndOffset = calculateFeaturesEndOffset(bytes, headerMeta);
+    const hasGraphSection = featuresEndOffset < bytes.length;
+
+    const graphMeta = hasGraphSection ? parseGraphSectionHeader(bytes, featuresEndOffset) : null;
+
+    if (metaFn) {
+        const combinedMeta: FlatGeoGraphBufMeta = {
+            features: headerMeta,
+            graph: graphMeta,
+        };
+        metaFn(combinedMeta);
+    }
 
     for await (const feature of genericDeserialize(bytes, fromFeature, undefined, undefined)) {
         features.push(feature as IGeoJsonFeature);
     }
 
-    const featuresEndOffset = calculateFeaturesEndOffset(bytes, headerMeta);
-
-    // Graph section starts directly after features (no separate magic bytes)
-    const adjacencyList: AdjacencyList =
-        featuresEndOffset < bytes.length ? parseGraphSection(bytes, featuresEndOffset) : { edges: [] };
+    const adjacencyList: AdjacencyList = hasGraphSection ? parseGraphSection(bytes, featuresEndOffset) : { edges: [] };
 
     return { features, adjacencyList };
 }

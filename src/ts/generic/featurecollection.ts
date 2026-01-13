@@ -2,7 +2,7 @@ import * as flatbuffers from 'flatbuffers';
 import slice from 'slice-source';
 import { ArrayReader } from '../array-reader.js';
 import type { ColumnMeta } from '../column-meta.js';
-import { magicbytes, SIZE_PREFIX_LEN } from '../constants.js';
+import { isValidMagicBytes, magicbytes, SIZE_PREFIX_LEN } from '../constants.js';
 import { Column } from '../flat-geobuf/column.js';
 import { ColumnType } from '../flat-geobuf/column-type.js';
 import { Crs } from '../flat-geobuf/crs.js';
@@ -50,7 +50,7 @@ export async function* deserialize(
     rect?: Rect,
     headerMetaFn?: HeaderMetaFn,
 ): AsyncGenerator<IFeature> {
-    if (!bytes.subarray(0, 3).every((v, i) => magicbytes[i] === v)) throw new Error('Not a FlatGeobuf file');
+    if (!isValidMagicBytes(bytes)) throw new Error('Not a FlatGeobuf file');
 
     if (rect) {
         const reader = ArrayReader.open(bytes);
@@ -73,7 +73,7 @@ export async function* deserialize(
     if (indexNodeSize > 0) offset += calcTreeSize(featuresCount, indexNodeSize);
 
     let id = 0;
-    while (offset < bb.capacity()) {
+    while (offset < bb.capacity() && (featuresCount === 0 || id < featuresCount)) {
         const featureLength = bb.readUint32(offset);
         bb.setPosition(offset);
         const feature = Feature.getSizePrefixedRootAsFeature(bb);
@@ -91,7 +91,7 @@ export async function* deserializeStream(
     const read: ReadFn = async (size) => await reader.slice(size);
 
     let bytes = new Uint8Array(await read(8, 'magic bytes'));
-    if (!bytes.subarray(0, 3).every((v, i) => magicbytes[i] === v)) throw new Error('Not a FlatGeobuf file');
+    if (!isValidMagicBytes(bytes)) throw new Error('Not a FlatGeobuf file');
     const headerLengthBytes = new Uint8Array(await read(4, 'header length'));
     let bb = new flatbuffers.ByteBuffer(headerLengthBytes);
     const headerLength = bb.readUint32(0);
@@ -191,7 +191,7 @@ export async function readMetadata(url: string, nocache = false, headers: Header
 
     const bytes = new Uint8Array(await httpClient.getRange(0, assumedHeaderLength, 'read metadata'));
 
-    if (!bytes.subarray(0, 3).every((v, i) => magicbytes[i] === v)) throw new Error('Not a FlatGeobuf file');
+    if (!isValidMagicBytes(bytes)) throw new Error('Not a FlatGeobuf file');
 
     const bb = new flatbuffers.ByteBuffer(bytes);
     bb.setPosition(magicbytes.length);

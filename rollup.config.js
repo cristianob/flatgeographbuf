@@ -29,9 +29,9 @@ export default [
     {
         input: './lib/mjs/generic.js',
         output: {
-            file: 'dist/flatgeobuf.min.js',
+            file: 'dist/flatgeographbuf.min.js',
             format: 'umd',
-            name: 'flatgeobuf',
+            name: 'flatgeographbuf',
             sourcemap: false,
         },
         plugins,
@@ -39,9 +39,9 @@ export default [
     {
         input: './lib/mjs/geojson.js',
         output: {
-            file: 'dist/flatgeobuf-geojson.min.js',
+            file: 'dist/flatgeographbuf-geojson.min.js',
             format: 'umd',
-            name: 'flatgeobuf',
+            name: 'flatgeographbuf',
             sourcemap: false,
         },
         plugins,
@@ -61,9 +61,9 @@ export default [
             'ol/proj.js',
         ],
         output: {
-            file: 'dist/flatgeobuf-ol.min.js',
+            file: 'dist/flatgeographbuf-ol.min.js',
             format: 'umd',
-            name: 'flatgeobuf',
+            name: 'flatgeographbuf',
             sourcemap: false,
             globals: {
                 'ol/Feature.js': 'ol.Feature',

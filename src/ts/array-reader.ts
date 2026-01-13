@@ -1,5 +1,5 @@
 import * as flatbuffers from 'flatbuffers';
-import { magicbytes, SIZE_PREFIX_LEN } from './constants.js';
+import { isValidMagicBytes, magicbytes, SIZE_PREFIX_LEN } from './constants.js';
 import { Feature } from './flat-geobuf/feature.js';
 import type { HeaderMeta } from './header-meta.js';
 import { fromByteBuffer } from './header-meta.js';
@@ -24,7 +24,7 @@ export class ArrayReader {
     }
 
     static open(bytes: Uint8Array): ArrayReader {
-        if (!bytes.subarray(0, 3).every((v, i) => magicbytes[i] === v)) {
+        if (!isValidMagicBytes(bytes)) {
             throw new Error('Not a FlatGeobuf file');
         }
 

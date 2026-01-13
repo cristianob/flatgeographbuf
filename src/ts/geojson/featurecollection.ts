@@ -1,3 +1,4 @@
+import * as flatbuffers from 'flatbuffers';
 import type {
     FeatureCollection as GeoJsonFeatureCollection,
     GeometryCollection,
@@ -9,8 +10,8 @@ import type {
     Polygon,
 } from 'geojson';
 import type { ColumnMeta } from '../column-meta.js';
-
-import { magicbytes } from '../constants.js';
+import { magicbytes, SIZE_PREFIX_LEN } from '../constants.js';
+import { Feature } from '../flat-geobuf/feature.js';
 import { buildFeature, type IFeature, type IProperties } from '../generic/feature.js';
 import {
     buildHeader,
@@ -21,12 +22,19 @@ import {
 } from '../generic/featurecollection.js';
 import { inferGeometryType } from '../generic/header.js';
 import type { HeaderMetaFn } from '../generic.js';
+import { buildGraphSection, deserializeGraphStream, parseGraphSection } from '../graph.js';
+import type { AdjacencyList, AdjacencyListInput, DeserializeGraphResult, Edge } from '../graph-types.js';
 import type { HeaderMeta } from '../header-meta.js';
-import type { Rect } from '../packedrtree.js';
-import { fromFeature } from './feature.js';
+import { fromByteBuffer } from '../header-meta.js';
+import { calcTreeSize, type Rect } from '../packedrtree.js';
+import { fromFeature, type IGeoJsonFeature } from './feature.js';
 import { parseGC, parseGeometry } from './geometry.js';
 
-export function serialize(featurecollection: GeoJsonFeatureCollection, crsCode = 0): Uint8Array {
+export function serialize(
+    featurecollection: GeoJsonFeatureCollection,
+    adjacencyList?: AdjacencyListInput,
+    crsCode = 0,
+): Uint8Array {
     const headerMeta = introspectHeaderMeta(featurecollection);
     const header = buildHeader(headerMeta, crsCode);
     const features: Uint8Array[] = featurecollection.features.map((f) =>
@@ -40,28 +48,42 @@ export function serialize(featurecollection: GeoJsonFeatureCollection, crsCode =
             headerMeta,
         ),
     );
-    const featuresLength = features.map((f) => f.length).reduce((a, b) => a + b);
-    const uint8 = new Uint8Array(magicbytes.length + header.length + featuresLength);
+    const featuresLength = features.map((f) => f.length).reduce((a, b) => a + b, 0);
+
+    let graphSection: Uint8Array | null = null;
+    if (adjacencyList) {
+        graphSection = buildGraphSection(adjacencyList, featurecollection.features.length);
+    }
+
+    const totalLength = magicbytes.length + header.length + featuresLength + (graphSection?.length ?? 0);
+    const uint8 = new Uint8Array(totalLength);
+
+    uint8.set(magicbytes);
     uint8.set(header, magicbytes.length);
+
     let offset = magicbytes.length + header.length;
     for (const feature of features) {
         uint8.set(feature, offset);
         offset += feature.length;
     }
-    uint8.set(magicbytes);
+
+    if (graphSection) {
+        uint8.set(graphSection, offset);
+    }
+
     return uint8;
 }
 
-export async function* deserialize(
-    bytes: Uint8Array,
+export async function* deserializeStream(
+    input: Uint8Array | ReadableStream,
     rect?: Rect,
     headerMetaFn?: HeaderMetaFn,
 ): AsyncGenerator<IFeature> {
-    yield* genericDeserialize(bytes, fromFeature, rect, headerMetaFn);
-}
-
-export function deserializeStream(stream: ReadableStream, headerMetaFn?: HeaderMetaFn): AsyncGenerator<IFeature> {
-    return genericDeserializeStream(stream, fromFeature, headerMetaFn);
+    if (input instanceof Uint8Array) {
+        yield* genericDeserialize(input, fromFeature, rect, headerMetaFn);
+    } else {
+        yield* genericDeserializeStream(input, fromFeature, headerMetaFn);
+    }
 }
 
 export function deserializeFiltered(
@@ -74,9 +96,64 @@ export function deserializeFiltered(
     return genericDeserializeFiltered(url, rect, fromFeature, headerMetaFn, nocache, headers);
 }
 
+function calculateFeaturesEndOffset(bytes: Uint8Array, headerMeta: HeaderMeta): number {
+    const bb = new flatbuffers.ByteBuffer(bytes);
+    const headerLength = bb.readUint32(magicbytes.length);
+    let offset = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
+
+    if (headerMeta.indexNodeSize > 0) {
+        offset += calcTreeSize(headerMeta.featuresCount, headerMeta.indexNodeSize);
+    }
+
+    let featuresRead = 0;
+    while (featuresRead < headerMeta.featuresCount && offset < bytes.length) {
+        const featureLength = bb.readUint32(offset);
+        offset += SIZE_PREFIX_LEN + featureLength;
+        featuresRead++;
+    }
+
+    return offset;
+}
+
+export async function deserialize(
+    bytes: Uint8Array,
+    headerMetaFn?: HeaderMetaFn,
+): Promise<DeserializeGraphResult<IGeoJsonFeature>> {
+    const features: IGeoJsonFeature[] = [];
+
+    const bb = new flatbuffers.ByteBuffer(bytes);
+    bb.setPosition(magicbytes.length);
+    const headerMeta = fromByteBuffer(bb);
+    if (headerMetaFn) headerMetaFn(headerMeta);
+
+    for await (const feature of genericDeserialize(bytes, fromFeature, undefined, undefined)) {
+        features.push(feature as IGeoJsonFeature);
+    }
+
+    const featuresEndOffset = calculateFeaturesEndOffset(bytes, headerMeta);
+
+    // Graph section starts directly after features (no separate magic bytes)
+    const adjacencyList: AdjacencyList =
+        featuresEndOffset < bytes.length ? parseGraphSection(bytes, featuresEndOffset) : { edges: [] };
+
+    return { features, adjacencyList };
+}
+
+export async function* deserializeGraphEdges(bytes: Uint8Array): AsyncGenerator<Edge, void, unknown> {
+    const bb = new flatbuffers.ByteBuffer(bytes);
+    bb.setPosition(magicbytes.length);
+    const headerMeta = fromByteBuffer(bb);
+
+    const featuresEndOffset = calculateFeaturesEndOffset(bytes, headerMeta);
+
+    if (featuresEndOffset >= bytes.length) return;
+
+    yield* deserializeGraphStream(bytes, featuresEndOffset);
+}
+
 function introspectHeaderMeta(featurecollection: GeoJsonFeatureCollection): HeaderMeta {
     const feature = featurecollection.features[0];
-    const properties = feature.properties;
+    const properties = feature?.properties;
 
     let columns: ColumnMeta[] | null = null;
     if (properties) columns = Object.keys(properties).map((k) => mapColumn(properties, k));

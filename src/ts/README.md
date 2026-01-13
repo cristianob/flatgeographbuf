@@ -1,4 +1,4 @@
-# FlatGeobuf for JavaScript / TypeScript
+# FlatGeoGraphBuf for TypeScript
 
 ## Building
 
@@ -6,40 +6,80 @@
 
 You must have [`pnpm`](https://pnpm.io) installed.
 
-### Install FlatGeobuf dependencies
+### Install dependencies
 
-    pnpm install
+```bash
+pnpm install
+```
 
 ### Build
 
-To compile the typescript into a javascript bundle
+To compile TypeScript and create bundles:
 
-    pnpm build
+```bash
+pnpm build
+```
+
+### Testing
+
+```bash
+pnpm test
+```
+
+### Type checking
+
+```bash
+pnpm type-check
+```
+
+### Generate API documentation
+
+```bash
+pnpm typedoc
+```
 
 See the `scripts` section in [package.json](../../package.json) for other actions.
 
-### Testing the examples locally.
+## Project Structure
 
-The examples are hard coded to pull in the publicly released artifact.
-If you'd like to test against your local changes, after running `pnpm build`,
-update the `<script src=` tags in the examples.
-
-For example:
-
-```diff
-diff --git a/examples/leaflet/filtered.html b/examples/leaflet/filtered.html
-index 2e13dfc..da4b07e 100644
---- a/examples/leaflet/filtered.html
-+++ b/examples/leaflet/filtered.html
-@@ -4,7 +4,7 @@
-     <link rel="stylesheet" href="/examples/site.css" />
-     <script src="https://unpkg.com/underscore@1.13.6/underscore-min.js"></script>
-     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
--    <script src="https://unpkg.com/flatgeobuf@4.3.3/dist/flatgeobuf-geojson.min.js"></script>
-+    <script src="/dist/flatgeobuf-geojson.min.js"></script>
-     <script src="https://unpkg.com/json-formatter-js@2.5.23/dist/json-formatter.umd.js"></script>
+```
+src/ts/
+├── flatgeographbuf.ts    # Main exports
+├── geojson.ts            # GeoJSON-specific API
+├── generic.ts            # Generic feature API
+├── graph.ts              # Graph section encoding/decoding
+├── graph-types.ts        # Graph type definitions
+├── constants.ts          # Magic bytes and constants
+├── geojson/              # GeoJSON module implementation
+├── generic/              # Generic module implementation
+├── flat-geobuf/          # FlatBuffers generated code
+└── *.spec.ts             # Test files
 ```
 
-You can start the built in http server with: `pnpm serve`.
+## Usage Example
 
-Then, open the example in your browser. For example: `open http://localhost:8000/examples/leaflet/filtered.html`.
+```typescript
+import { serialize, deserialize } from './geojson.js';
+import type { AdjacencyList } from './graph-types.js';
+
+// Create a simple graph
+const geojson = {
+    type: 'FeatureCollection',
+    features: [
+        { type: 'Feature', geometry: { type: 'Point', coordinates: [0, 0] }, properties: { name: 'A' } },
+        { type: 'Feature', geometry: { type: 'Point', coordinates: [1, 1] }, properties: { name: 'B' } },
+    ]
+};
+
+const adjacencyList: AdjacencyList = {
+    edges: [{ from: 0, to: 1, properties: { weight: 1.5 } }]
+};
+
+// Serialize
+const bytes = serialize(geojson, adjacencyList);
+
+// Deserialize
+const result = await deserialize(bytes);
+console.log(result.features);
+console.log(result.adjacencyList);
+```

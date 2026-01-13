@@ -2,7 +2,7 @@ import { Repeater } from '@repeaterjs/repeater';
 import * as flatbuffers from 'flatbuffers';
 
 import Config from './config.js';
-import { magicbytes, SIZE_PREFIX_LEN } from './constants.js';
+import { isValidMagicBytes, magicbytes, SIZE_PREFIX_LEN } from './constants.js';
 import { Feature } from './flat-geobuf/feature.js';
 import type { HeaderMeta } from './header-meta.js';
 import { fromByteBuffer } from './header-meta.js';
@@ -77,7 +77,7 @@ export class HttpReader {
 
         {
             const bytes = new Uint8Array(await headerClient.getRange(0, 8, minReqLength, 'header'));
-            if (!bytes.subarray(0, 3).every((v, i) => magicbytes[i] === v)) {
+            if (!isValidMagicBytes(bytes)) {
                 console.error(`bytes: ${bytes} != ${magicbytes}`);
                 throw new Error('Not a FlatGeobuf file');
             }

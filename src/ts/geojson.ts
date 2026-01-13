@@ -4,74 +4,55 @@ import type { IGeoJsonFeature } from './geojson/feature.js';
 import {
     deserialize as fcDeserialize,
     deserializeFiltered as fcDeserializeFiltered,
+    deserializeGraphEdges as fcDeserializeGraphEdges,
     deserializeStream as fcDeserializeStream,
     serialize as fcSerialize,
 } from './geojson/featurecollection.js';
+import type { AdjacencyListInput, DeserializeGraphResult, Edge } from './graph-types.js';
 import type { Rect } from './packedrtree.js';
 
-/**
- * Serialize GeoJSON to FlatGeobuf
- * @param geojson GeoJSON object to serialize
- */
-export function serialize(geojson: GeoJsonFeatureCollection, crsCode = 0): Uint8Array {
-    const bytes = fcSerialize(geojson, crsCode);
-    return bytes;
+export type {
+    AdjacencyList,
+    AdjacencyListInput,
+    DeserializeGraphResult,
+    Edge,
+    EdgeInput,
+    EdgeProperties,
+} from './graph-types.js';
+
+export function serialize(
+    geojson: GeoJsonFeatureCollection,
+    adjacencyList?: AdjacencyListInput,
+    crsCode = 0,
+): Uint8Array {
+    return fcSerialize(geojson, adjacencyList, crsCode);
 }
 
-/**
- * Deserialize FlatGeobuf into GeoJSON features
- * @param url Input string
- * @param rect Filter rectangle - NOT USED
- * @param headerMetaFn Callback that will receive header metadata when available
- */
-export function deserialize(
+export async function deserialize(
+    bytes: Uint8Array,
+    headerMetaFn?: HeaderMetaFn,
+): Promise<DeserializeGraphResult<IGeoJsonFeature>> {
+    return fcDeserialize(bytes, headerMetaFn);
+}
+
+export function deserializeStream(
+    input: Uint8Array | ReadableStream,
+    rect?: Rect,
+    headerMetaFn?: HeaderMetaFn,
+): AsyncGenerator<IGeoJsonFeature> {
+    return fcDeserializeStream(input, rect, headerMetaFn) as AsyncGenerator<IGeoJsonFeature>;
+}
+
+export function deserializeFiltered(
     url: string,
-    rect?: Rect,
-    headerMetaFn?: HeaderMetaFn,
-    nocache?: boolean,
-    headers?: HeadersInit,
-): AsyncGenerator<IGeoJsonFeature>;
-
-/**
- * Deserialize FlatGeobuf from a typed array into GeoJSON features
- * NOTE: Does not support spatial filtering
- * @param typedArray Input byte array
- * @param rect Filter rectangle - NOT USED
- * @param headerMetaFn Callback that will receive header metadata when available
- */
-export function deserialize(
-    typedArray: Uint8Array,
-    rect?: Rect,
-    headerMetaFn?: HeaderMetaFn,
-    nocache?: boolean,
-    headers?: HeadersInit,
-): AsyncGenerator<IGeoJsonFeature>;
-
-/**
- * Deserialize FlatGeobuf from a stream into GeoJSON features
- * NOTE: Does not support spatial filtering
- * @param stream stream
- * @param rect Filter rectangle
- * @param headerMetaFn Callback that will receive header metadata when available
- */
-export function deserialize(
-    stream: ReadableStream,
-    rect?: Rect,
-    headerMetaFn?: HeaderMetaFn,
-    nocache?: boolean,
-    headers?: HeadersInit,
-): AsyncGenerator<IGeoJsonFeature>;
-
-/** Implementation */
-export function deserialize(
-    input: Uint8Array | ReadableStream | string,
-    rect?: Rect,
+    rect: Rect,
     headerMetaFn?: HeaderMetaFn,
     nocache = false,
     headers: HeadersInit = {},
 ): AsyncGenerator<IGeoJsonFeature> {
-    if (input instanceof Uint8Array) return fcDeserialize(input, rect, headerMetaFn) as AsyncGenerator<IGeoJsonFeature>;
-    if (input instanceof ReadableStream)
-        return fcDeserializeStream(input, headerMetaFn) as AsyncGenerator<IGeoJsonFeature>;
-    return fcDeserializeFiltered(input, rect!, headerMetaFn, nocache, headers) as AsyncGenerator<IGeoJsonFeature>;
+    return fcDeserializeFiltered(url, rect, headerMetaFn, nocache, headers) as AsyncGenerator<IGeoJsonFeature>;
+}
+
+export function deserializeGraphEdges(bytes: Uint8Array): AsyncGenerator<Edge, void, unknown> {
+    return fcDeserializeGraphEdges(bytes);
 }

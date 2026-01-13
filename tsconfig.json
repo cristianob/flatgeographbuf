@@ -21,7 +21,7 @@
     "typedocOptions": {
         "out": "dist/doc",
         "exclude": ["**/*.spec.ts"],
-        "entryPoints": ["src/ts/flatgeobuf.ts"],
+        "entryPoints": ["src/ts/flatgeographbuf.ts"],
         "readme": "none"
     }
 }

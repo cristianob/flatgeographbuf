@@ -20,6 +20,7 @@ A performant binary encoding for **geospatial graphs**. Built on top of [FlatGeo
   - [6. Working with remote files](#6-working-with-remote-files)
   - [7. Performance tuning: when to preload, when to release](#7-performance-tuning-when-to-preload-when-to-release)
   - [8. Plugging in a custom byte source](#8-plugging-in-a-custom-byte-source)
+  - [9. Property indices: text, number, boolean searches](#9-property-indices-text-number-boolean-searches)
 - [API reference](#api-reference)
 - [Binary format](#binary-format)
 - [Design decisions](#design-decisions)
@@ -328,6 +329,60 @@ const fgg = await FlatGeoGraphBuf.open(reader);
 ```
 
 Implementing `readAll()` is optional but recommended — it turns `preload()` into a single round-trip and lets the library work even with sources that don't support byte ranges.
+
+### 9. Property indices: text, number, boolean searches
+
+Need to find a feature by name, filter edges by length, or locate vertices in a numeric range without scanning the whole graph? Declare which columns to index at write time and use `findVerticesBy*` / `findEdgesBy*` at read time.
+
+```typescript
+import { serialize, FlatGeoGraphBuf } from 'flatgeographbuf/geojson';
+
+const bytes = serialize(geojson, adjacency, {
+    columnIndex: {
+        vertices: ['name', 'icao', 'elev_ft', 'intl'],
+        edges:    ['road', 'km', 'paved'],
+    },
+});
+
+const fgg = await FlatGeoGraphBuf.open(bytes);
+
+// Text — tokenises the query, AND-intersects on token prefixes
+for await (const f of fgg.findVerticesByText('name', 'rio preto')) {
+    console.log(f.properties.name);
+}
+
+// Numeric ranges
+for await (const f of fgg.findVerticesByValue('elev_ft', { gte: 1000, lt: 5000 })) { … }
+for await (const f of fgg.findVerticesByValue('elev_ft', { eq: 1200 })) { … }
+
+// Booleans
+for await (const f of fgg.findVerticesByValue('intl', { eq: true })) { … }
+
+// Edges work the same way
+for await (const e of fgg.findEdgesByText('road', 'br-1')) { … }
+for await (const e of fgg.findEdgesByValue('km', { gt: 500 }, { limit: 10 })) { … }
+```
+
+**Type inference**: the writer inspects the first non-null value of each declared column. `string` → text index, `number` → numeric range index, `boolean` → posting list.
+
+**Text search**:
+- **Normalisation**: NFKD + diacritic strip + lowercase. `"São José"` → `"sao jose"`.
+- **Tokenisation**: split on Unicode whitespace, punctuation, and symbols. `"BR-116"` → `["br", "116"]`.
+- **AND-intersect**: every query token must match (in any order).
+- **Three match modes** via `{ match: 'prefix' | 'token' | 'exact' }`:
+  - `'prefix'` (default) — `"rio pre"` matches "São José do Rio **Pre**to".
+  - `'token'` — each query token must be a full indexed token (no prefix). Use for code lookups like ICAO.
+  - `'exact'` — the entire normalised query equals the entire indexed value's token sequence.
+- **Ranked output**:
+  1. Tier A — query tokens appear consecutive and in order
+  2. Tier B — in order with gaps
+  3. Tier C — present, any order
+  
+  Within a tier, earlier match position ranks first. Pass `{ limit: 20 }` for top-K.
+
+**Composes with spatial filter**: collect results from `featuresInBbox` and `findVerticesByText` into Sets, then intersect.
+
+**Storage**: ~1.5 MB per text column for 50 k features × 2-3 words each, ~600 KB for numeric columns. Linear in the number of records × average tokens per value.
 
 ---
 

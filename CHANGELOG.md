@@ -5,6 +5,65 @@ follows [Keep a Changelog](https://keepachangelog.com/). Wire-format
 changes are tracked separately in
 [`doc/format-changelog.md`](doc/format-changelog.md).
 
+## 2.1.0
+
+Property indices on vertex features and edges — text, number, and
+boolean columns. **Format change:** the binary layout grows a 1-byte
+`indexFlags` trailer after the vertex R-tree (padded to 8 bytes for
+alignment) and a new optional block in the graph section. 2.0.0
+readers cannot open 2.1.0 files; 2.1.0 readers can open 2.0.0 files
+with no property indices, because the indexFlags is just `0` there.
+
+### Added
+
+- **`columnIndex`** option on `serialize()`:
+  ```typescript
+  serialize(geojson, adjacency, {
+      columnIndex: {
+          vertices: ['name', 'icao', 'elev_ft', 'active'],
+          edges: ['road', 'km', 'paved'],
+      },
+  });
+  ```
+  Writer infers per-column type (string → text index, number → numeric
+  index, boolean → posting lists) and emits one block per side.
+- **Text query**: `findVerticesByText(column, query, options?)` and
+  `findEdgesByText(column, query, options?)`. The query is normalised
+  (NFKD + diacritic strip + lowercase) and tokenised. AND-intersect
+  across all query tokens.
+- **Three match modes**:
+  - `'prefix'` (default): each query token can be a prefix of an
+    indexed token. `findByText('name', 'rio pre')` matches
+    "São José do Rio Preto".
+  - `'token'`: each query token must equal an indexed token exactly.
+  - `'exact'`: the full normalised query must equal the entire
+    indexed value's token sequence.
+- **Ranked results** for text queries:
+  - Tier A: query tokens appear consecutive and in order
+  - Tier B: in order with gaps
+  - Tier C: present but out of order
+  Within a tier, earlier match position ranks first.
+- **Value query**: `findVerticesByValue(column, predicate, options?)`
+  and `findEdgesByValue(column, predicate, options?)`. `predicate`
+  is `{ eq?, lt?, lte?, gt?, gte? }`. Number columns support ranges;
+  boolean columns support `eq: true/false`.
+- **`limit`** option on all `findBy*` methods.
+- **Cache lifecycle**: `loadPropertyIndices()` warms both vertex and
+  edge property index blocks; `releasePropertyIndices()` drops them.
+  Both are automatically driven by `preload()` / `release()`.
+
+### Wire format
+
+- Vertex section gains a 1-byte `indexFlags` trailer after the
+  optional vertex R-tree. Bit `0x01` signals a vertex property index
+  block follows (length-prefixed). The whole trailer is padded to a
+  multiple of 8 bytes so the features section stays Float64-aligned.
+- Graph section gains `indexFlags` bit `0x04` for an edge property
+  index block, sitting between the edge R-tree and the edges payload.
+- Both layouts are forward-compatible: readers skip blocks with
+  unknown `indexFlags` bits via their 4-byte size prefix, instead of
+  misinterpreting bytes.
+
 ## 2.0.0
 
 First production release. **This is a breaking change** vs. every 1.x —

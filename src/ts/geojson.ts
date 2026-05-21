@@ -7,7 +7,14 @@ import {
 } from './geojson/featurecollection.js';
 import type { AdjacencyListInput, DeserializeGraphResult, FlatGeoGraphBufMetaFn } from './graph-types.js';
 
-export type { SerializeOptions } from './geojson/featurecollection.js';
+export type { SerializeOptions, PropertyIndexSpec } from './geojson/featurecollection.js';
+export type {
+    MatchMode,
+    TextQueryOptions,
+    ValuePredicate,
+    ValueQueryOptions,
+    TextSearchHit,
+} from './property-index.js';
 export type {
     AdjacencyList,
     AdjacencyListInput,

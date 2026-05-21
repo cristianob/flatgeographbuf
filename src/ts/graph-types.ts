@@ -46,6 +46,13 @@ export interface GraphHeaderMeta {
     edgeColumns: ColumnMeta[] | null;
     hasAdjacencyIndex: boolean;
     hasEdgeIndex: boolean;
+    hasEdgePropertyIndex: boolean;
+    /**
+     * Any `indexFlags` bits set in the file that this reader does not
+     * recognise. Used by the layout parser to skip future optional
+     * blocks via their length prefix instead of misinterpreting bytes.
+     */
+    unknownIndexFlags: number;
 }
 
 export interface DeserializeGraphResult<T> {

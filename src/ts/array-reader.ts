@@ -69,7 +69,21 @@ export class ArrayReader {
     }
 
     private lengthBeforeFeatures(): number {
-        return this.lengthBeforeTree() + this.indexLength;
+        const afterTree = this.lengthBeforeTree() + this.indexLength;
+        // Skip the FGG vertex-extras trailer: 1B indexFlags + per-bit
+        // length-prefixed blocks, padded to multiple of 8.
+        let offset = afterTree;
+        const indexFlags = this.bytes[offset];
+        offset += 1;
+        const view = new DataView(this.bytes.buffer, this.bytes.byteOffset);
+        let unknown = indexFlags;
+        while (unknown !== 0) {
+            const size = view.getUint32(offset, true);
+            offset += SIZE_PREFIX_LEN + size;
+            unknown &= unknown - 1;
+        }
+        const logicalLen = offset - afterTree;
+        return afterTree + ((logicalLen + 7) & ~7);
     }
 
     private readFeature(featureOffset: number): Feature {

@@ -17,6 +17,16 @@ import { buildPackedRTree, envelopeOf, hilbertPermutation, type IndexItem } from
 
 const GRAPH_INDEX_FLAG_ADJACENCY = 0x01;
 const GRAPH_INDEX_FLAG_EDGE_RTREE = 0x02;
+const GRAPH_INDEX_FLAG_EDGE_PROPS = 0x04;
+/**
+ * Bits beyond these are reserved for forward-compatible extensions.
+ * Readers must walk over unknown-but-present optional blocks via their
+ * length prefix instead of misinterpreting their bytes.
+ */
+const GRAPH_INDEX_FLAG_KNOWN =
+    GRAPH_INDEX_FLAG_ADJACENCY |
+    GRAPH_INDEX_FLAG_EDGE_RTREE |
+    GRAPH_INDEX_FLAG_EDGE_PROPS;
 
 /**
  * Locate the byte offset at which the graph section starts inside `bytes`.
@@ -34,17 +44,111 @@ const GRAPH_INDEX_FLAG_EDGE_RTREE = 0x02;
  *
  * Critically, this function never reads the feature payloads themselves.
  */
-export function findGraphSectionStart(bytes: Uint8Array, header: HeaderMeta): number {
-    const bb = new flatbuffers.ByteBuffer(bytes);
-    const headerLength = bb.readUint32(magicbytes.length);
+// Vertex-section indexFlags bits (mirror the graph-section flag pattern
+// for symmetry). Lives in a single byte immediately after the optional
+// vertex R-tree; readers skip unknown bits via length prefixes.
+const VERTEX_INDEX_FLAG_PROPERTIES = 0x01;
+const VERTEX_INDEX_FLAG_KNOWN = VERTEX_INDEX_FLAG_PROPERTIES;
+const VERTEX_INDEX_FLAGS_BYTE_LEN = 1;
+
+/**
+ * Resolve the byte offsets of the vertex-section optional blocks and
+ * the features payload start. Layout:
+ *
+ *   [Vertex R-tree?]            (signalled by header.indexNodeSize > 0)
+ *   [vertex indexFlags: 1B]     (always present)
+ *   [Vertex Property Index?]    (length-prefixed; bit 0 of indexFlags)
+ *   …reserved future vertex blocks…
+ *   [Features payload]
+ */
+export interface VertexLayout {
+    vertexIndexFlags: number;
+    vertexPropertyIndexStart: number | null;
+    vertexPropertyIndexBytes: number;
+    unknownVertexIndexFlags: number;
+    featuresStart: number;
+}
+
+export function locateVertexLayout(bytes: Uint8Array, header: HeaderMeta): VertexLayout {
+    const headerLength = new DataView(bytes.buffer, bytes.byteOffset + magicbytes.length).getUint32(0, true);
     let offset = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
+    if (header.indexNodeSize > 0 && header.featuresCount > 0) {
+        offset += calcTreeSize(header.featuresCount, header.indexNodeSize);
+    }
+    const extrasStart = offset;
+
+    const indexFlags = bytes[offset];
+    offset += VERTEX_INDEX_FLAGS_BYTE_LEN;
+
+    const readBlockSize = (): number =>
+        new DataView(bytes.buffer, bytes.byteOffset + offset).getUint32(0, true);
+
+    let vertexPropertyIndexStart: number | null = null;
+    let vertexPropertyIndexBytes = 0;
+    if ((indexFlags & VERTEX_INDEX_FLAG_PROPERTIES) !== 0) {
+        const size = readBlockSize();
+        vertexPropertyIndexStart = offset + SIZE_PREFIX_LEN;
+        vertexPropertyIndexBytes = size;
+        offset += SIZE_PREFIX_LEN + size;
+    }
+
+    // Forward-compat: walk any blocks whose flag bit we don't recognise.
+    let unknown = indexFlags & ~VERTEX_INDEX_FLAG_KNOWN;
+    const unknownFlags = unknown;
+    while (unknown !== 0) {
+        const size = readBlockSize();
+        offset += SIZE_PREFIX_LEN + size;
+        unknown &= unknown - 1;
+    }
+
+    // Round up to a multiple of 8 to honour the writer's alignment
+    // padding (keeps Float64 geometries in the features section aligned).
+    const logicalLen = offset - extrasStart;
+    offset = extrasStart + ((logicalLen + 7) & ~7);
+
+    return {
+        vertexIndexFlags: indexFlags,
+        vertexPropertyIndexStart,
+        vertexPropertyIndexBytes,
+        unknownVertexIndexFlags: unknownFlags,
+        featuresStart: offset,
+    };
+}
+
+/** Build the vertex-section trailer (1B flags + optional blocks).
+ *  `vertexPropertyIndex`, when present, is expected to already include
+ *  its 4-byte size prefix (same convention as `buildAdjacencyBlock`).
+ *  The emitted size is padded to a multiple of 8 so the features
+ *  section that follows keeps its natural Float64 alignment. */
+export function buildVertexExtras(vertexPropertyIndex: Uint8Array | null): Uint8Array {
+    let flags = 0;
+    if (vertexPropertyIndex) flags |= VERTEX_INDEX_FLAG_PROPERTIES;
+    const logicalLen =
+        VERTEX_INDEX_FLAGS_BYTE_LEN + (vertexPropertyIndex ? vertexPropertyIndex.byteLength : 0);
+    const paddedLen = (logicalLen + 7) & ~7;
+    const buf = new Uint8Array(paddedLen);
+    buf[0] = flags;
+    if (vertexPropertyIndex) {
+        buf.set(vertexPropertyIndex, VERTEX_INDEX_FLAGS_BYTE_LEN);
+    }
+    return buf;
+}
+
+export function findGraphSectionStart(bytes: Uint8Array, header: HeaderMeta): number {
+    const { featuresStart } = locateVertexLayout(bytes, header);
+    let offset = featuresStart;
 
     if (header.featuresCount === 0) return offset;
 
     if (header.indexNodeSize > 0) {
+        // R-tree present → use its last leaf to locate the last feature
+        // in O(1) reads.
+        const headerLength = new DataView(bytes.buffer, bytes.byteOffset + magicbytes.length).getUint32(
+            0,
+            true,
+        );
+        const treeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
         const treeSize = calcTreeSize(header.featuresCount, header.indexNodeSize);
-        const treeStart = offset;
-        const featuresStart = treeStart + treeSize;
         if (featuresStart >= bytes.length) return bytes.length;
 
         const totalNodes = treeSize / NODE_ITEM_BYTE_LEN;
@@ -63,6 +167,7 @@ export function findGraphSectionStart(bytes: Uint8Array, header: HeaderMeta): nu
         return lastFeatureAbsPos + SIZE_PREFIX_LEN + lastFeatureSize;
     }
 
+    const bb = new flatbuffers.ByteBuffer(bytes);
     let read = 0;
     while (read < header.featuresCount && offset < bytes.length) {
         const featureLength = bb.readUint32(offset);
@@ -72,6 +177,9 @@ export function findGraphSectionStart(bytes: Uint8Array, header: HeaderMeta): nu
     return offset;
 }
 
+// Re-export the vertex flag constant for the writer / async reader.
+export { VERTEX_INDEX_FLAG_PROPERTIES, VERTEX_INDEX_FLAGS_BYTE_LEN };
+
 export interface BuildGraphSectionOptions {
     writeAdjacencyIndex?: boolean;
     writeEdgeIndex?: boolean;
@@ -79,6 +187,9 @@ export interface BuildGraphSectionOptions {
      * `writeEdgeIndex` is true so edges with null geometry can still be
      * placed in the R-tree using their endpoints' positions. */
     vertexBboxes?: Rect[];
+    /** Pre-built edge property index block (length-prefixed). Inserted
+     *  after the edge R-tree, before the edges payload, when present. */
+    edgePropertyIndex?: Uint8Array | null;
 }
 
 const textEncoder = new TextEncoder();
@@ -438,6 +549,8 @@ export function buildGraphSection(
         indexFlags |= GRAPH_INDEX_FLAG_EDGE_RTREE;
         rtreeBlock = buildEdgeRTreeBlock(orderedEdges, edgeByteOffsets, options.vertexBboxes);
     }
+    const edgePropertyIndex = options.edgePropertyIndex ?? null;
+    if (edgePropertyIndex) indexFlags |= GRAPH_INDEX_FLAG_EDGE_PROPS;
 
     const graphHeader = buildGraphHeader(orderedEdges.length, edgeColumns, indexFlags);
 
@@ -446,6 +559,7 @@ export function buildGraphSection(
         graphHeader.length +
         (adjBlock?.length ?? 0) +
         (rtreeBlock?.length ?? 0) +
+        (edgePropertyIndex?.length ?? 0) +
         edgesLength;
     const result = new Uint8Array(totalLength);
     let offset = 0;
@@ -463,6 +577,10 @@ export function buildGraphSection(
     if (rtreeBlock) {
         result.set(rtreeBlock, offset);
         offset += rtreeBlock.length;
+    }
+    if (edgePropertyIndex) {
+        result.set(edgePropertyIndex, offset);
+        offset += edgePropertyIndex.length;
     }
 
     for (const edgeBuffer of edgeBuffers) {
@@ -516,6 +634,8 @@ function parseGraphHeader(bytes: Uint8Array, offset: number): GraphHeaderMeta {
         edgeColumns: edgeColumns.length > 0 ? edgeColumns : null,
         hasAdjacencyIndex: (indexFlags & GRAPH_INDEX_FLAG_ADJACENCY) !== 0,
         hasEdgeIndex: (indexFlags & GRAPH_INDEX_FLAG_EDGE_RTREE) !== 0,
+        hasEdgePropertyIndex: (indexFlags & GRAPH_INDEX_FLAG_EDGE_PROPS) !== 0,
+        unknownIndexFlags: indexFlags & ~GRAPH_INDEX_FLAG_KNOWN,
     };
 }
 
@@ -658,6 +778,8 @@ export interface GraphSectionLayout {
     adjacencyOffsetsBytes: number;
     edgeRTreeStart: number | null;
     edgeRTreeBytes: number;
+    edgePropertyIndexStart: number | null;
+    edgePropertyIndexBytes: number;
     edgesStart: number;
 }
 
@@ -667,10 +789,13 @@ export function parseGraphSectionLayout(bytes: Uint8Array, offset: number): Grap
     const header = parseGraphHeader(bytes, offset + SIZE_PREFIX_LEN);
     let cursor = offset + SIZE_PREFIX_LEN + headerSize;
 
+    const readBlockSize = (): number =>
+        new DataView(bytes.buffer, bytes.byteOffset + cursor).getUint32(0, true);
+
     let adjacencyOffsetsStart: number | null = null;
     let adjacencyOffsetsBytes = 0;
     if (header.hasAdjacencyIndex) {
-        const blockSize = new DataView(bytes.buffer, bytes.byteOffset + cursor).getUint32(0, true);
+        const blockSize = readBlockSize();
         adjacencyOffsetsStart = cursor + SIZE_PREFIX_LEN;
         adjacencyOffsetsBytes = blockSize;
         cursor += SIZE_PREFIX_LEN + blockSize;
@@ -679,10 +804,29 @@ export function parseGraphSectionLayout(bytes: Uint8Array, offset: number): Grap
     let edgeRTreeStart: number | null = null;
     let edgeRTreeBytes = 0;
     if (header.hasEdgeIndex) {
-        const blockSize = new DataView(bytes.buffer, bytes.byteOffset + cursor).getUint32(0, true);
+        const blockSize = readBlockSize();
         edgeRTreeStart = cursor + SIZE_PREFIX_LEN;
         edgeRTreeBytes = blockSize;
         cursor += SIZE_PREFIX_LEN + blockSize;
+    }
+
+    let edgePropertyIndexStart: number | null = null;
+    let edgePropertyIndexBytes = 0;
+    if (header.hasEdgePropertyIndex) {
+        const blockSize = readBlockSize();
+        edgePropertyIndexStart = cursor + SIZE_PREFIX_LEN;
+        edgePropertyIndexBytes = blockSize;
+        cursor += SIZE_PREFIX_LEN + blockSize;
+    }
+
+    // Forward-compat: skip any optional blocks added by newer writers
+    // whose flag bits we don't recognise. Each block is length-prefixed,
+    // so we can walk past them without interpretation.
+    let unknown = header.unknownIndexFlags;
+    while (unknown !== 0) {
+        const blockSize = readBlockSize();
+        cursor += SIZE_PREFIX_LEN + blockSize;
+        unknown &= unknown - 1; // clear the lowest set bit
     }
 
     return {
@@ -691,6 +835,8 @@ export function parseGraphSectionLayout(bytes: Uint8Array, offset: number): Grap
         adjacencyOffsetsBytes,
         edgeRTreeStart,
         edgeRTreeBytes,
+        edgePropertyIndexStart,
+        edgePropertyIndexBytes,
         edgesStart: cursor,
     };
 }

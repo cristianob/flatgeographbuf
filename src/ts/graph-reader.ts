@@ -7,6 +7,16 @@ import { parseEdge, parseGraphSectionLayout, type GraphSectionLayout } from './g
 import type { Edge, FeaturesHeaderMeta } from './graph-types.js';
 import { fromByteBuffer, type HeaderMeta } from './header-meta.js';
 import { calcTreeSize, DEFAULT_NODE_SIZE, NODE_ITEM_BYTE_LEN, type Rect, streamSearch } from './packedrtree.js';
+import {
+    parsePropertyIndexBlock,
+    searchBool,
+    searchNumeric,
+    searchText,
+    type PropertyIndex,
+    type TextQueryOptions,
+    type ValuePredicate,
+    type ValueQueryOptions,
+} from './property-index.js';
 import { runShortestPath, type ShortestPathOptions, type ShortestPathResult } from './shortest-path.js';
 
 /**
@@ -53,9 +63,19 @@ export class FlatGeoGraphBuf {
      *  `outgoingEdgesOf` reads vertex offsets from memory instead of
      *  issuing a tiny range read per vertex. */
     private adjacencyOffsetsBytes: Uint8Array | null = null;
+    /** Parsed vertex property indices, lazy-loaded on first text/value
+     *  query. Drop with `releasePropertyIndices()`. */
+    private vertexPropertyIndex: PropertyIndex | null = null;
+    /** Parsed edge property indices, same lifecycle as the vertex one. */
+    private edgePropertyIndex: PropertyIndex | null = null;
 
     /** Byte offset of the start of the (optional) vertex R-tree. */
     private readonly vertexRTreeStart: number;
+    /** Byte offset of the vertex property index block content; `null`
+     *  when the file has no vertex property index. */
+    readonly vertexPropertyIndexStart: number | null;
+    /** Length of the vertex property index block in bytes. */
+    readonly vertexPropertyIndexBytes: number;
 
     private constructor(
         reader: ByteReader,
@@ -64,6 +84,8 @@ export class FlatGeoGraphBuf {
         featuresStart: number,
         featuresLength: number,
         vertexRTreeStart: number,
+        vertexPropertyIndexStart: number | null,
+        vertexPropertyIndexBytes: number,
     ) {
         this.reader = reader;
         this.featureHeader = featureHeader;
@@ -72,6 +94,8 @@ export class FlatGeoGraphBuf {
         this.featuresStart = featuresStart;
         this.featuresLength = featuresLength;
         this.vertexRTreeStart = vertexRTreeStart;
+        this.vertexPropertyIndexStart = vertexPropertyIndexStart;
+        this.vertexPropertyIndexBytes = vertexPropertyIndexBytes;
     }
 
     /**
@@ -100,17 +124,19 @@ export class FlatGeoGraphBuf {
         const headerBb = new flatbuffers.ByteBuffer(headerBytes);
         const featureHeader = fromByteBuffer(headerBb);
 
-        const { featuresStart, featuresLength, graphStart } = await locateGraphSection(reader, featureHeader);
-        const layout = await readGraphLayout(reader, graphStart);
+        const located = await locateGraphSection(reader, featureHeader);
+        const layout = await readGraphLayout(reader, located.graphStart);
         const vertexRTreeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
 
         return new FlatGeoGraphBuf(
             reader,
             featureHeader,
             layout,
-            featuresStart,
-            featuresLength,
+            located.featuresStart,
+            located.featuresLength,
             vertexRTreeStart,
+            located.vertexPropertyIndexStart,
+            located.vertexPropertyIndexBytes,
         );
     }
 
@@ -367,6 +393,167 @@ export class FlatGeoGraphBuf {
         return runShortestPath(this, from, to, options);
     }
 
+    // ────────────────────── Property-index queries ─────────────────────
+
+    /**
+     * Find vertex features whose value of text column `column` matches
+     * `query`. Tokens of `query` are AND-intersected; results are
+     * ranked (tier A: consecutive in order > tier B: in order with
+     * gaps > tier C: any order), then by earliest match position.
+     *
+     * Requires the file to have been serialized with
+     * `columnIndex: { vertices: [...] }` including `column`.
+     */
+    async *findVerticesByText(
+        column: string,
+        query: string,
+        options?: TextQueryOptions,
+    ): AsyncGenerator<IGeoJsonFeature, void, unknown> {
+        const idx = await this.requirePropertyIndex('vertex');
+        const col = idx.text.get(column);
+        if (!col) throw new Error(`Vertex column "${column}" is not indexed as text`);
+        const hits = searchText(col, query, options);
+        for (const hit of hits) yield await this.getFeature(hit.recordId);
+    }
+
+    /**
+     * Find vertex features whose numeric/boolean value of `column`
+     * satisfies `predicate` (one of `{ eq, lt, lte, gt, gte }`). Number
+     * columns support range predicates; boolean columns support `eq`.
+     */
+    async *findVerticesByValue(
+        column: string,
+        predicate: ValuePredicate,
+        options?: ValueQueryOptions,
+    ): AsyncGenerator<IGeoJsonFeature, void, unknown> {
+        const idx = await this.requirePropertyIndex('vertex');
+        const num = idx.numeric.get(column);
+        if (num) {
+            for (const id of searchNumeric(num, predicate, options)) yield await this.getFeature(id);
+            return;
+        }
+        const bool = idx.bool.get(column);
+        if (bool) {
+            for (const id of searchBool(bool, predicate, options)) yield await this.getFeature(id);
+            return;
+        }
+        throw new Error(`Vertex column "${column}" is not indexed as number or boolean`);
+    }
+
+    /**
+     * Edge equivalent of `findVerticesByText`. Yields full `Edge`
+     * objects in ranked order. Requires `columnIndex: { edges: [...] }` at
+     * write time.
+     */
+    async *findEdgesByText(
+        column: string,
+        query: string,
+        options?: TextQueryOptions,
+    ): AsyncGenerator<Edge, void, unknown> {
+        const idx = await this.requirePropertyIndex('edge');
+        const col = idx.text.get(column);
+        if (!col) throw new Error(`Edge column "${column}" is not indexed as text`);
+        const hits = searchText(col, query, options);
+        for (const hit of hits) yield await this.getEdgeByStorageIndex(hit.recordId);
+    }
+
+    async *findEdgesByValue(
+        column: string,
+        predicate: ValuePredicate,
+        options?: ValueQueryOptions,
+    ): AsyncGenerator<Edge, void, unknown> {
+        const idx = await this.requirePropertyIndex('edge');
+        const num = idx.numeric.get(column);
+        if (num) {
+            for (const id of searchNumeric(num, predicate, options)) {
+                yield await this.getEdgeByStorageIndex(id);
+            }
+            return;
+        }
+        const bool = idx.bool.get(column);
+        if (bool) {
+            for (const id of searchBool(bool, predicate, options)) {
+                yield await this.getEdgeByStorageIndex(id);
+            }
+            return;
+        }
+        throw new Error(`Edge column "${column}" is not indexed as number or boolean`);
+    }
+
+    /**
+     * Bulk-load both property index blocks (vertex + edge) into memory.
+     * Cheap and idempotent; useful before a batch of `findBy*` queries
+     * on a remote file. Released via `releasePropertyIndices()`.
+     */
+    async loadPropertyIndices(): Promise<void> {
+        const needsVertex = this.vertexPropertyIndexStart !== null && this.vertexPropertyIndex === null;
+        const needsEdge = this.layout.edgePropertyIndexStart !== null && this.edgePropertyIndex === null;
+        const tasks: Promise<unknown>[] = [];
+        if (needsVertex) tasks.push(this.loadVertexPropertyIndex());
+        if (needsEdge) tasks.push(this.loadEdgePropertyIndex());
+        await Promise.all(tasks);
+    }
+
+    /**
+     * Drop both cached property index blocks. The next `findBy*` query
+     * re-reads them from the underlying source.
+     */
+    releasePropertyIndices(): void {
+        this.vertexPropertyIndex = null;
+        this.edgePropertyIndex = null;
+    }
+
+    private async loadVertexPropertyIndex(): Promise<PropertyIndex> {
+        if (this.vertexPropertyIndex) return this.vertexPropertyIndex;
+        if (this.vertexPropertyIndexStart === null) {
+            throw new Error(
+                'File has no vertex property index. Re-serialize with columnIndex: { vertices: [...] }.',
+            );
+        }
+        const bytes = await this.reader.read(this.vertexPropertyIndexStart, this.vertexPropertyIndexBytes);
+        this.vertexPropertyIndex = parsePropertyIndexBlock(bytes);
+        return this.vertexPropertyIndex;
+    }
+
+    private async loadEdgePropertyIndex(): Promise<PropertyIndex> {
+        if (this.edgePropertyIndex) return this.edgePropertyIndex;
+        if (this.layout.edgePropertyIndexStart === null) {
+            throw new Error(
+                'File has no edge property index. Re-serialize with columnIndex: { edges: [...] }.',
+            );
+        }
+        const bytes = await this.reader.read(
+            this.layout.edgePropertyIndexStart,
+            this.layout.edgePropertyIndexBytes,
+        );
+        this.edgePropertyIndex = parsePropertyIndexBlock(bytes);
+        return this.edgePropertyIndex;
+    }
+
+    private requirePropertyIndex(side: 'vertex' | 'edge'): Promise<PropertyIndex> {
+        return side === 'vertex' ? this.loadVertexPropertyIndex() : this.loadEdgePropertyIndex();
+    }
+
+    /**
+     * Random-access edge fetch by its storage index (0-based, same
+     * order as `allEdges()`). Used by edge property-index queries.
+     */
+    private async getEdgeByStorageIndex(storageIdx: number): Promise<Edge> {
+        const edgeCount = this.layout.header.edgeCount;
+        if (storageIdx < 0 || storageIdx >= edgeCount) {
+            throw new Error(`Edge index out of range: ${storageIdx} (have ${edgeCount})`);
+        }
+        // If the entire edges section is cached, walk in-memory from the
+        // start. Otherwise we'd need O(N) round-trips — accept that for
+        // now; users with `findEdgesBy*` usage typically call loadEdges().
+        let i = 0;
+        for await (const edge of this.allEdges()) {
+            if (i === storageIdx) return edge;
+            i++;
+        }
+        throw new Error(`Internal: edge ${storageIdx} not found`);
+    }
+
     /**
      * Bulk-fetch the entire edges section into memory and populate the
      * per-vertex outgoing-edges cache. Subsequent calls to
@@ -547,9 +734,11 @@ export class FlatGeoGraphBuf {
             await this.loadIndices();
             await this.loadFeatures();
             await this.loadEdges();
+            await this.loadPropertyIndices();
             return;
         }
         await this.preloadSingleRequest();
+        await this.loadPropertyIndices();
     }
 
     /**
@@ -622,6 +811,21 @@ export class FlatGeoGraphBuf {
                     this.outgoingEdgesCache.set(v, edges);
                 }
             }
+        }
+
+        // Property indices: parse from the in-memory buffer without
+        // any further I/O.
+        if (this.vertexPropertyIndexStart !== null) {
+            const start = this.vertexPropertyIndexStart;
+            this.vertexPropertyIndex = parsePropertyIndexBlock(
+                all.subarray(start, start + this.vertexPropertyIndexBytes),
+            );
+        }
+        if (this.layout.edgePropertyIndexStart !== null) {
+            const start = this.layout.edgePropertyIndexStart;
+            this.edgePropertyIndex = parsePropertyIndexBlock(
+                all.subarray(start, start + this.layout.edgePropertyIndexBytes),
+            );
         }
     }
 
@@ -720,6 +924,7 @@ export class FlatGeoGraphBuf {
         this.releaseFeatures();
         this.releaseEdges();
         this.releaseIndices();
+        this.releasePropertyIndices();
     }
 
     /** Drop only the vertex-feature cache. */
@@ -875,21 +1080,58 @@ function parseFeatureBytes(bytes: Uint8Array, header: HeaderMeta): IGeoJsonFeatu
  * Discover where the graph section starts. Reads at most one R-tree leaf
  * and one size prefix, regardless of how many features the file has.
  */
-async function locateGraphSection(
-    reader: ByteReader,
-    header: HeaderMeta,
-): Promise<{ featuresStart: number; featuresLength: number; graphStart: number }> {
+interface LocatedSections {
+    featuresStart: number;
+    featuresLength: number;
+    graphStart: number;
+    vertexPropertyIndexStart: number | null;
+    vertexPropertyIndexBytes: number;
+}
+
+async function locateGraphSection(reader: ByteReader, header: HeaderMeta): Promise<LocatedSections> {
     const headerLengthBytes = await reader.read(magicbytes.length, SIZE_PREFIX_LEN);
     const headerLength = new DataView(headerLengthBytes.buffer, headerLengthBytes.byteOffset).getUint32(0, true);
 
     const treeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
-    let featuresStart = treeStart;
+    let vertexExtrasStart = treeStart;
     if (header.indexNodeSize > 0 && header.featuresCount > 0) {
-        featuresStart += calcTreeSize(header.featuresCount, header.indexNodeSize);
+        vertexExtrasStart += calcTreeSize(header.featuresCount, header.indexNodeSize);
     }
 
+    // Parse the 1-byte vertex indexFlags and any optional vertex blocks.
+    const flagsBytes = await reader.read(vertexExtrasStart, 1);
+    const vertexIndexFlags = flagsBytes[0];
+    let cursor = vertexExtrasStart + 1;
+    let vertexPropertyIndexStart: number | null = null;
+    let vertexPropertyIndexBytes = 0;
+    if ((vertexIndexFlags & 0x01) !== 0) {
+        const sizeBytes = await reader.read(cursor, SIZE_PREFIX_LEN);
+        const size = new DataView(sizeBytes.buffer, sizeBytes.byteOffset).getUint32(0, true);
+        vertexPropertyIndexStart = cursor + SIZE_PREFIX_LEN;
+        vertexPropertyIndexBytes = size;
+        cursor += SIZE_PREFIX_LEN + size;
+    }
+    // Forward-compat: skip unknown vertex extras blocks
+    let unknown = vertexIndexFlags & ~0x01;
+    while (unknown !== 0) {
+        const sizeBytes = await reader.read(cursor, SIZE_PREFIX_LEN);
+        const size = new DataView(sizeBytes.buffer, sizeBytes.byteOffset).getUint32(0, true);
+        cursor += SIZE_PREFIX_LEN + size;
+        unknown &= unknown - 1;
+    }
+    // Round up to multiple of 8 for the writer's alignment padding.
+    const logicalLen = cursor - vertexExtrasStart;
+    cursor = vertexExtrasStart + ((logicalLen + 7) & ~7);
+    const featuresStart = cursor;
+
     if (header.featuresCount === 0) {
-        return { featuresStart, featuresLength: 0, graphStart: featuresStart };
+        return {
+            featuresStart,
+            featuresLength: 0,
+            graphStart: featuresStart,
+            vertexPropertyIndexStart,
+            vertexPropertyIndexBytes,
+        };
     }
 
     if (header.indexNodeSize > 0) {
@@ -907,18 +1149,30 @@ async function locateGraphSection(
         const lastSizeBytes = await reader.read(featuresStart + lastFeatureRelOffset, SIZE_PREFIX_LEN);
         const lastSize = new DataView(lastSizeBytes.buffer, lastSizeBytes.byteOffset).getUint32(0, true);
         const featuresLength = lastFeatureRelOffset + SIZE_PREFIX_LEN + lastSize;
-        return { featuresStart, featuresLength, graphStart: featuresStart + featuresLength };
+        return {
+            featuresStart,
+            featuresLength,
+            graphStart: featuresStart + featuresLength,
+            vertexPropertyIndexStart,
+            vertexPropertyIndexBytes,
+        };
     }
 
     // No R-tree → walk size prefixes. O(N) reads, expensive over a
     // remote ByteReader.
-    let cursor = 0;
+    let walkCursor = 0;
     for (let i = 0; i < header.featuresCount; i++) {
-        const sizeBytes = await reader.read(featuresStart + cursor, SIZE_PREFIX_LEN);
+        const sizeBytes = await reader.read(featuresStart + walkCursor, SIZE_PREFIX_LEN);
         const size = new DataView(sizeBytes.buffer, sizeBytes.byteOffset).getUint32(0, true);
-        cursor += SIZE_PREFIX_LEN + size;
+        walkCursor += SIZE_PREFIX_LEN + size;
     }
-    return { featuresStart, featuresLength: cursor, graphStart: featuresStart + cursor };
+    return {
+        featuresStart,
+        featuresLength: walkCursor,
+        graphStart: featuresStart + walkCursor,
+        vertexPropertyIndexStart,
+        vertexPropertyIndexBytes,
+    };
 }
 
 /**
@@ -932,39 +1186,34 @@ async function readGraphLayout(reader: ByteReader, graphStart: number): Promise<
     const headerSize = new DataView(headerSizeBytes.buffer, headerSizeBytes.byteOffset).getUint32(0, true);
     const headerBytes = await reader.read(graphStart, SIZE_PREFIX_LEN + headerSize);
 
-    // parseGraphSectionLayout treats `offset` as absolute within its
-    // input buffer, so we pad to `graphStart + …` and place the bytes
-    // we read at the matching positions.
-    const padded = new Uint8Array(graphStart + SIZE_PREFIX_LEN + headerSize + 8);
-    padded.set(headerBytes, graphStart);
-    let cursor = graphStart + SIZE_PREFIX_LEN + headerSize;
-
+    // Walk each optional block's 4-byte size prefix without reading its
+    // body, building a synthetic buffer addressed at `graphStart`.
+    // `parseGraphSectionLayout` then resolves offsets in absolute terms.
     const indexFlags = headerBytes[SIZE_PREFIX_LEN + headerSize - 1];
-    const hasAdj = (indexFlags & 0x01) !== 0;
-    const hasRTree = (indexFlags & 0x02) !== 0;
-
-    if (hasAdj) {
-        const sizePref = await reader.read(cursor, SIZE_PREFIX_LEN);
-        const adjSize = new DataView(sizePref.buffer, sizePref.byteOffset).getUint32(0, true);
-        const needed = cursor + SIZE_PREFIX_LEN + adjSize + (hasRTree ? SIZE_PREFIX_LEN : 0);
-        const grown = new Uint8Array(needed);
-        grown.set(padded.subarray(0, cursor));
-        grown.set(sizePref, cursor);
-        cursor += SIZE_PREFIX_LEN + adjSize;
-        if (hasRTree) {
-            const rtreeSizePref = await reader.read(cursor, SIZE_PREFIX_LEN);
-            grown.set(rtreeSizePref, cursor);
+    const popcount = (x: number): number => {
+        let c = 0;
+        let v = x;
+        while (v !== 0) {
+            c += v & 1;
+            v >>>= 1;
         }
-        return parseGraphSectionLayout(grown, graphStart);
-    }
+        return c;
+    };
+    const optionalBlockCount = popcount(indexFlags);
 
-    if (hasRTree) {
+    let cursor = graphStart + SIZE_PREFIX_LEN + headerSize;
+    const sizePrefBytes: Array<{ at: number; bytes: Uint8Array }> = [];
+    for (let i = 0; i < optionalBlockCount; i++) {
         const sizePref = await reader.read(cursor, SIZE_PREFIX_LEN);
-        const grown = new Uint8Array(cursor + SIZE_PREFIX_LEN);
-        grown.set(padded.subarray(0, cursor));
-        grown.set(sizePref, cursor);
-        return parseGraphSectionLayout(grown, graphStart);
+        const blockSize = new DataView(sizePref.buffer, sizePref.byteOffset).getUint32(0, true);
+        sizePrefBytes.push({ at: cursor, bytes: sizePref });
+        cursor += SIZE_PREFIX_LEN + blockSize;
     }
 
+    const padded = new Uint8Array(cursor);
+    padded.set(headerBytes, graphStart);
+    for (const { at, bytes } of sizePrefBytes) {
+        padded.set(bytes, at);
+    }
     return parseGraphSectionLayout(padded, graphStart);
 }

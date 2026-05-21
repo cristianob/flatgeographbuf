@@ -33,9 +33,12 @@ export function serialize(features: IFeature[]): Uint8Array {
         return buildFeature(parseGeometry(f.getGeometry(), headerMeta.geometryType), f.getProperties(), headerMeta);
     });
     const featuresLength = featureBuffers.map((f) => f.length).reduce((a, b) => a + b);
-    const uint8 = new Uint8Array(magicbytes.length + header.length + featuresLength);
+    // FGG vertex-extras trailer: 1 byte indexFlags = 0 + 7 bytes padding
+    // to keep features section Float64-aligned. Always present in FGG.
+    const VERTEX_EXTRAS_BYTES = 8;
+    const uint8 = new Uint8Array(magicbytes.length + header.length + VERTEX_EXTRAS_BYTES + featuresLength);
     uint8.set(header, magicbytes.length);
-    let offset = magicbytes.length + header.length;
+    let offset = magicbytes.length + header.length + VERTEX_EXTRAS_BYTES; // flags byte stays 0
     for (const feature of featureBuffers) {
         uint8.set(feature, offset);
         offset += feature.length;
@@ -71,6 +74,26 @@ export async function* deserialize(
 
     const { indexNodeSize, featuresCount } = headerMeta;
     if (indexNodeSize > 0) offset += calcTreeSize(featuresCount, indexNodeSize);
+
+    // Skip the FGG vertex-extras trailer (1B indexFlags + per-bit
+    // length-prefixed blocks). Each bit not set has no corresponding
+    // block; each bit set is followed by a 4B size + content. Unknown
+    // bits are skipped via their length prefix (forward compat). The
+    // whole trailer is padded to a multiple of 8 to keep features
+    // section Float64-aligned.
+    const vxExtrasStart = offset;
+    const vertexIndexFlags = bytes[offset];
+    offset += 1;
+    let unknownVertexFlags = vertexIndexFlags;
+    while (unknownVertexFlags !== 0) {
+        const blockSize = bb.readUint32(offset);
+        offset += SIZE_PREFIX_LEN + blockSize;
+        unknownVertexFlags &= unknownVertexFlags - 1;
+    }
+    {
+        const logicalLen = offset - vxExtrasStart;
+        offset = vxExtrasStart + ((logicalLen + 7) & ~7);
+    }
 
     let id = 0;
     while (offset < bb.capacity() && (featuresCount === 0 || id < featuresCount)) {
@@ -109,6 +132,19 @@ export async function* deserializeStream(
         const treeSize = calcTreeSize(featuresCount, indexNodeSize);
         await read(treeSize, 'entire index, w/o rect');
     }
+    // Skip the FGG vertex-extras trailer (see byte-array deserialize).
+    let vxConsumed = 1;
+    const vxFlagsBuf = new Uint8Array(await read(1, 'vertex indexFlags'));
+    let vxUnknown = vxFlagsBuf[0];
+    while (vxUnknown !== 0) {
+        const sizeBuf = new Uint8Array(await read(4, 'vertex extras block size'));
+        const blockSize = new DataView(sizeBuf.buffer).getUint32(0, true);
+        vxConsumed += 4 + blockSize;
+        if (blockSize > 0) await read(blockSize, 'vertex extras block content');
+        vxUnknown &= vxUnknown - 1;
+    }
+    const vxPadding = ((vxConsumed + 7) & ~7) - vxConsumed;
+    if (vxPadding > 0) await read(vxPadding, 'vertex extras alignment padding');
     let feature: IFeature | undefined;
     let id = 0;
     while ((feature = await readFeature(read, headerMeta, fromFeature, id++))) yield feature;

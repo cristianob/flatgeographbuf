@@ -24,6 +24,7 @@ import { inferGeometryType } from '../generic/header.js';
 import type { HeaderMetaFn } from '../generic.js';
 import {
     buildGraphSection,
+    buildVertexExtras,
     deserializeGraphStream,
     findGraphSectionStart,
     parseGraphSection,
@@ -44,6 +45,16 @@ import { DEFAULT_NODE_SIZE, type Rect } from '../packedrtree.js';
 import { buildPackedRTree, envelopeOf, hilbertPermutation, type IndexItem } from '../packedrtree-writer.js';
 import { fromFeature, type IGeoJsonFeature } from './feature.js';
 import { parseGC, parseGeometry } from './geometry.js';
+import { buildPropertyIndexBlock } from '../property-index.js';
+
+export interface PropertyIndexSpec {
+    /** Names of vertex feature property fields to index. Type (text /
+     *  number / boolean) is inferred from the first non-null value. */
+    vertices?: string[];
+    /** Names of edge property fields to index. Same type-inference rule
+     *  as vertices. */
+    edges?: string[];
+}
 
 export interface SerializeOptions {
     /** EPSG code for the dataset CRS (default: `4326`, WGS84). */
@@ -69,6 +80,13 @@ export interface SerializeOptions {
      * when there is no adjacencyList).
      */
     writeEdgeIndex?: boolean;
+    /**
+     * Per-column property indices on vertex features and/or edges.
+     * Enables `findVerticesByText`, `findVerticesByValue`,
+     * `findEdgesByText`, `findEdgesByValue`. Default: no property
+     * indices.
+     */
+    columnIndex?: PropertyIndexSpec;
 }
 
 interface NormalizedOptions {
@@ -76,6 +94,7 @@ interface NormalizedOptions {
     writeIndex: boolean;
     writeAdjacencyIndex: boolean;
     writeEdgeIndex: boolean;
+    columnIndex: PropertyIndexSpec;
 }
 
 function normalizeOptions(opts: SerializeOptions | undefined): NormalizedOptions {
@@ -84,6 +103,7 @@ function normalizeOptions(opts: SerializeOptions | undefined): NormalizedOptions
         writeIndex: opts?.writeIndex ?? true,
         writeAdjacencyIndex: opts?.writeAdjacencyIndex ?? true,
         writeEdgeIndex: opts?.writeEdgeIndex ?? true,
+        columnIndex: opts?.columnIndex ?? {},
     };
 }
 
@@ -137,7 +157,7 @@ export function serialize(
     adjacencyList?: AdjacencyListInput,
     options?: SerializeOptions,
 ): Uint8Array {
-    const { crsCode, writeIndex, writeAdjacencyIndex, writeEdgeIndex } = normalizeOptions(options);
+    const { crsCode, writeIndex, writeAdjacencyIndex, writeEdgeIndex, columnIndex } = normalizeOptions(options);
     // Edge-related index flags only make sense with a graph section.
     const effectiveAdjacencyIndex = writeAdjacencyIndex && adjacencyList !== undefined;
     const effectiveEdgeIndex = writeEdgeIndex && adjacencyList !== undefined;
@@ -208,17 +228,58 @@ export function serialize(
         indexBytes = buildPackedRTree(items, indexNodeSize);
     }
 
-    let graphSection: Uint8Array | null = null;
-    if (remappedAdjacency) {
-        graphSection = buildGraphSection(remappedAdjacency, featureCount, {
-            writeAdjacencyIndex: effectiveAdjacencyIndex,
-            writeEdgeIndex: effectiveEdgeIndex,
-            vertexBboxes: effectiveEdgeIndex ? orderedBboxes : undefined,
+    let vertexPropertyIndex: Uint8Array | null = null;
+    if (columnIndex.vertices && columnIndex.vertices.length > 0 && featureCount > 0) {
+        vertexPropertyIndex = buildPropertyIndexBlock({
+            columns: columnIndex.vertices,
+            count: featureCount,
+            valueAt: (i, col) =>
+                (orderedFeatures[i].properties as Record<string, unknown> | null | undefined)?.[col],
         });
     }
 
+    let edgePropertyIndex: Uint8Array | null = null;
+    if (
+        columnIndex.edges &&
+        columnIndex.edges.length > 0 &&
+        remappedAdjacency &&
+        remappedAdjacency.edges.length > 0
+    ) {
+        // Edges are reordered inside buildGraphSection when the adjacency
+        // index is requested; we need to mirror that ordering here.
+        const orderedEdges = effectiveAdjacencyIndex
+            ? [...remappedAdjacency.edges].sort((a, b) => a.from - b.from)
+            : remappedAdjacency.edges;
+        edgePropertyIndex = buildPropertyIndexBlock({
+            columns: columnIndex.edges,
+            count: orderedEdges.length,
+            valueAt: (i, col) =>
+                (orderedEdges[i].properties as Record<string, unknown> | null | undefined)?.[col],
+        });
+    }
+
+    let graphSection: Uint8Array | null = null;
+    if (remappedAdjacency !== undefined || edgePropertyIndex !== null) {
+        graphSection = buildGraphSection(remappedAdjacency ?? { edges: [] }, featureCount, {
+            writeAdjacencyIndex: effectiveAdjacencyIndex,
+            writeEdgeIndex: effectiveEdgeIndex,
+            vertexBboxes: effectiveEdgeIndex ? orderedBboxes : undefined,
+            edgePropertyIndex,
+        });
+    }
+
+    // Vertex extras trailer (1B indexFlags + optional length-prefixed
+    // blocks) lives between the vertex R-tree and the features payload.
+    // Mirrors the graph-section flag-based layout for symmetry.
+    const vertexExtras = buildVertexExtras(vertexPropertyIndex);
+
     const totalLength =
-        magicbytes.length + header.length + (indexBytes?.length ?? 0) + featuresLength + (graphSection?.length ?? 0);
+        magicbytes.length +
+        header.length +
+        (indexBytes?.length ?? 0) +
+        vertexExtras.length +
+        featuresLength +
+        (graphSection?.length ?? 0);
     const uint8 = new Uint8Array(totalLength);
 
     uint8.set(magicbytes);
@@ -229,6 +290,8 @@ export function serialize(
         uint8.set(indexBytes, offset);
         offset += indexBytes.length;
     }
+    uint8.set(vertexExtras, offset);
+    offset += vertexExtras.length;
     for (const feature of featureBuffers) {
         uint8.set(feature, offset);
         offset += feature.length;

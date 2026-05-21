@@ -333,6 +333,80 @@ describe('edge property indices', () => {
     });
 });
 
+describe('lookup-driven shortcuts', () => {
+    it('text hits expose the storage index alongside the feature', async () => {
+        const { geojson, adjacency } = cityNetwork();
+        const bytes = serialize(geojson, adjacency, { columnIndex: { vertices: ['icao'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const [hit] = await collect(fgg.findVerticesByText('icao', 'sbsp', { match: 'exact', limit: 1 }));
+        expect(hit).toBeDefined();
+        expect(typeof hit.index).toBe('number');
+        // The returned index can be fed straight back into the file's
+        // index-based methods.
+        const sameFeature = await fgg.getFeature(hit.index);
+        expect(sameFeature.properties).toEqual(hit.feature.properties);
+    });
+
+    it('vertexIndexBy resolves text columns to a file index', async () => {
+        const { geojson, adjacency } = cityNetwork();
+        const bytes = serialize(geojson, adjacency, { columnIndex: { vertices: ['icao'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const idx = await fgg.vertexIndexBy({ column: 'icao', value: 'SBBR' });
+        const f = await fgg.getFeature(idx);
+        expect((f.properties as { name: string }).name).toBe('Brasília');
+    });
+
+    it('vertexIndexBy resolves numeric and boolean columns too', async () => {
+        const { geojson, adjacency } = cityNetwork();
+        const bytes = serialize(geojson, adjacency, {
+            columnIndex: { vertices: ['elev_ft', 'intl'] },
+        });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const byElev = await fgg.vertexIndexBy({ column: 'elev_ft', value: 3497 });
+        expect((await fgg.getFeature(byElev)).properties.name).toBe('Brasília');
+        const anyIntl = await fgg.vertexIndexBy({ column: 'intl', value: true });
+        expect(
+            ['São Paulo', 'Brasília'].includes(
+                (await fgg.getFeature(anyIntl)).properties.name as string,
+            ),
+        ).toBe(true);
+    });
+
+    it('vertexIndexBy throws when no record matches', async () => {
+        const { geojson, adjacency } = cityNetwork();
+        const bytes = serialize(geojson, adjacency, { columnIndex: { vertices: ['icao'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        await expect(
+            fgg.vertexIndexBy({ column: 'icao', value: 'ZZZZ' }),
+        ).rejects.toThrow(/No vertex found/);
+    });
+
+    it('shortestPath accepts { column, value } directly for both endpoints', async () => {
+        const { geojson, adjacency } = cityNetwork();
+        const bytes = serialize(geojson, adjacency, { columnIndex: { vertices: ['icao'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const path = await fgg.shortestPath(
+            { column: 'icao', value: 'SBSP' },
+            { column: 'icao', value: 'SBSR' },
+            { heuristic: null },
+        );
+        expect(path).not.toBeNull();
+        expect(path?.vertices[0].properties.icao).toBe('SBSP');
+        expect(path?.vertices[path.vertices.length - 1].properties.icao).toBe('SBSR');
+    });
+
+    it('shortestPath still works with mixed forms (index + lookup)', async () => {
+        const { geojson, adjacency } = cityNetwork();
+        const bytes = serialize(geojson, adjacency, { columnIndex: { vertices: ['icao'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const fromIdx = await fgg.vertexIndexBy({ column: 'icao', value: 'SBSP' });
+        const path = await fgg.shortestPath(fromIdx, { column: 'icao', value: 'SBRJ' }, { heuristic: null });
+        expect(path).not.toBeNull();
+        expect(path?.vertices[0].properties.icao).toBe('SBSP');
+        expect(path?.vertices[path.vertices.length - 1].properties.icao).toBe('SBRJ');
+    });
+});
+
 describe('error paths', () => {
     it('throws when querying an unindexed text column', async () => {
         const { geojson, adjacency } = cityNetwork();

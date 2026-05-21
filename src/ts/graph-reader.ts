@@ -24,10 +24,23 @@ import {
  *  - `'B'`: query tokens appear in order with gaps
  *  - `'C'`: query tokens all present, possibly out of order
  *  Results are emitted in tier order (A → B → C), then by earliest
- *  matched position. */
+ *  matched position. `index` is the storage index of the record in
+ *  the file (useful to feed back into `shortestPath`, `getFeature`,
+ *  `outgoingEdgesOf`, etc.). */
 export type TextHit<T, Key extends 'feature' | 'edge' = 'feature'> = Key extends 'edge'
-    ? { edge: T; tier: 'A' | 'B' | 'C' }
-    : { feature: T; tier: 'A' | 'B' | 'C' };
+    ? { edge: T; tier: 'A' | 'B' | 'C'; index: number }
+    : { feature: T; tier: 'A' | 'B' | 'C'; index: number };
+
+/** Convenient pointer to a single vertex by property lookup, accepted
+ *  anywhere `shortestPath` (and similar) takes a vertex index. The
+ *  underlying column must have been declared in `columnIndex.vertices`
+ *  at write time. Matches the first vertex whose normalised text
+ *  token / numeric value / boolean equals `value`; throws when no
+ *  record matches. */
+export interface VertexLookup {
+    column: string;
+    value: string | number | boolean;
+}
 import { runShortestPath, type ShortestPathOptions, type ShortestPathResult } from './shortest-path.js';
 
 /**
@@ -411,13 +424,58 @@ export class FlatGeoGraphBuf {
      * Compute a shortest path between two vertices. Requires
      * `writeAdjacencyIndex: true`. Vertex features are fetched lazily —
      * only vertices actually visited by the search are parsed.
+     *
+     * `from` and `to` accept either a raw file index (`number`) or a
+     * `{ column, value }` lookup descriptor. The descriptor form
+     * resolves the vertex via the property index of `column` (which
+     * must have been declared at write time); use it to skip the
+     * "find by code → run shortestPath" two-step.
      */
-    shortestPath(
-        from: number,
-        to: number,
+    async shortestPath(
+        from: number | VertexLookup,
+        to: number | VertexLookup,
         options?: ShortestPathOptions,
     ): Promise<ShortestPathResult | null> {
-        return runShortestPath(this, from, to, options);
+        const fromIdx = typeof from === 'number' ? from : await this.vertexIndexBy(from);
+        const toIdx = typeof to === 'number' ? to : await this.vertexIndexBy(to);
+        return runShortestPath(this, fromIdx, toIdx, options);
+    }
+
+    /**
+     * Resolve a `{ column, value }` lookup to a vertex's storage
+     * index. Useful when the caller already has a code (ICAO, IATA,
+     * an id) and needs the index to feed into `shortestPath`,
+     * `getFeature` or `outgoingEdgesOf`. Throws when no record
+     * matches the lookup.
+     */
+    async vertexIndexBy(lookup: VertexLookup): Promise<number> {
+        const idx = await this.requirePropertyIndex('vertex');
+        const { column, value } = lookup;
+        if (typeof value === 'string') {
+            const col = idx.text.get(column);
+            if (!col) throw new Error(`Vertex column "${column}" is not indexed as text`);
+            const hits = searchText(col, value, { match: 'exact', limit: 1 });
+            if (hits.length === 0) {
+                throw new Error(`No vertex found with ${column} = ${JSON.stringify(value)}`);
+            }
+            return hits[0].recordId;
+        }
+        if (typeof value === 'number') {
+            const num = idx.numeric.get(column);
+            if (!num) throw new Error(`Vertex column "${column}" is not indexed as number`);
+            const ids = searchNumeric(num, { eq: value }, { limit: 1 });
+            if (ids.length === 0) {
+                throw new Error(`No vertex found with ${column} = ${value}`);
+            }
+            return ids[0];
+        }
+        const bool = idx.bool.get(column);
+        if (!bool) throw new Error(`Vertex column "${column}" is not indexed as boolean`);
+        const ids = searchBool(bool, { eq: value }, { limit: 1 });
+        if (ids.length === 0) {
+            throw new Error(`No vertex found with ${column} = ${value}`);
+        }
+        return ids[0];
     }
 
     // ────────────────────── Property-index queries ─────────────────────
@@ -441,7 +499,11 @@ export class FlatGeoGraphBuf {
         if (!col) throw new Error(`Vertex column "${column}" is not indexed as text`);
         const hits = searchText(col, query, options);
         for (const hit of hits) {
-            yield { feature: await this.getFeature(hit.recordId), tier: hit.tier };
+            yield {
+                feature: await this.getFeature(hit.recordId),
+                tier: hit.tier,
+                index: hit.recordId,
+            };
         }
     }
 
@@ -484,7 +546,11 @@ export class FlatGeoGraphBuf {
         if (!col) throw new Error(`Edge column "${column}" is not indexed as text`);
         const hits = searchText(col, query, options);
         for (const hit of hits) {
-            yield { edge: await this.getEdgeByStorageIndex(hit.recordId), tier: hit.tier };
+            yield {
+                edge: await this.getEdgeByStorageIndex(hit.recordId),
+                tier: hit.tier,
+                index: hit.recordId,
+            };
         }
     }
 

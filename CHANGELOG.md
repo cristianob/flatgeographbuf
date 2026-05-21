@@ -5,7 +5,32 @@ follows [Keep a Changelog](https://keepachangelog.com/). Wire-format
 changes are tracked separately in
 [`doc/format-changelog.md`](doc/format-changelog.md).
 
-## 2.1.0 (unreleased)
+## 2.2.0
+
+API ergonomics: the "find by code → run shortestPath" flow can now
+be expressed in a single call. Tier-ranked text hits now carry the
+record's storage index so callers don't have to map back to it.
+
+### Added
+
+- `shortestPath(from, to)` accepts a `{ column, value }` descriptor
+  for either endpoint. It resolves the vertex via the column's
+  property index (must have been declared in `columnIndex.vertices`
+  at write time). The number-index form keeps working as before.
+- `FlatGeoGraphBuf.vertexIndexBy({ column, value })` returns the
+  storage index of the first vertex matching the lookup. Supports
+  text, number and boolean columns. Throws when no record matches.
+- New `VertexLookup` type exported from `flatgeographbuf/geojson`.
+- `TextHit` gains an `index` field (`{ feature/edge, tier, index }`)
+  so callers can pipe text hits back into index-driven APIs without
+  a separate lookup pass.
+
+### Wire format
+
+No changes to the binary format vs 2.1.0 — these are pure reader-API
+additions.
+
+## 2.1.0
 
 ### Wire format (compared to 2.0.0)
 

@@ -29,7 +29,7 @@ export type {
 } from './graph-types.js';
 
 // Random-access reader and byte-source abstraction
-export { FlatGeoGraphBuf, type TextHit } from './graph-reader.js';
+export { FlatGeoGraphBuf, type TextHit, type VertexLookup } from './graph-reader.js';
 export { byteReaderFromUint8Array, byteReaderFromUrl, type ByteReader, type UrlReaderOptions } from './byte-reader.js';
 export type { EdgeWeightFn, HeuristicFn, ShortestPathOptions, ShortestPathResult } from './shortest-path.js';
 

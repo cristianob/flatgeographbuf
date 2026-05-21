@@ -347,10 +347,11 @@ const bytes = serialize(geojson, adjacency, {
 const fgg = await FlatGeoGraphBuf.open(bytes);
 
 // Text — tokenises the query, AND-intersects on token prefixes.
-// Each hit carries the matched feature plus a `tier` label
-// ('A' | 'B' | 'C') describing how well it matched.
+// Each hit carries the matched feature, its storage `index` (so it
+// can be fed straight into shortestPath / getFeature / etc.) and a
+// `tier` label ('A' | 'B' | 'C') describing how well it matched.
 for await (const hit of fgg.findVerticesByText('name', 'rio preto')) {
-    console.log(hit.tier, hit.feature.properties.name);
+    console.log(hit.tier, hit.index, hit.feature.properties.name);
 }
 
 // Numeric ranges — return features directly (no tier ranking)
@@ -387,6 +388,28 @@ for await (const e of fgg.findEdgesByValue('km', { gt: 500 }, { limit: 10 })) { 
 **Composes with spatial filter**: collect results from `featuresInBbox` and `findVerticesByText` into Sets, then intersect (or use the hit's `feature` directly when joining).
 
 **Storage**: ~1.5 MB per text column for 50 k features × 2-3 words each, ~600 KB for numeric columns. Linear in the number of records × average tokens per value.
+
+#### From a code lookup straight into `shortestPath`
+
+The headline use case for property indices: a UI has an ICAO / IATA / waypoint identifier as a string and wants to route from it. Skip the explicit "find → index → call" trip by passing a `{ column, value }` lookup directly:
+
+```typescript
+// Resolves SDJD and SBBH via the `icao` text index, then runs A*.
+const path = await fgg.shortestPath(
+    { column: 'icao', value: 'SDJD' },
+    { column: 'icao', value: 'SBBH' },
+);
+```
+
+Equivalent long form (still useful if you want to surface the resolved indices to the caller):
+
+```typescript
+const fromIdx = await fgg.vertexIndexBy({ column: 'icao', value: 'SDJD' });
+const toIdx   = await fgg.vertexIndexBy({ column: 'icao', value: 'SBBH' });
+const path    = await fgg.shortestPath(fromIdx, toIdx);
+```
+
+The descriptor form accepts strings (resolved via the text index, `match: 'exact'`), numbers (via the numeric index, `eq:`), or booleans (via the bool index, `eq:`). Throws when no record matches. Mixing forms is fine: `shortestPath(fromIdx, { column, value })`.
 
 ---
 
@@ -564,13 +587,18 @@ class FlatGeoGraphBuf {
 
     // Property-index queries
     findVerticesByText(column: string, query: string, options?: TextQueryOptions):
-        AsyncGenerator<{ feature: IGeoJsonFeature; tier: 'A' | 'B' | 'C' }>;
+        AsyncGenerator<{ feature: IGeoJsonFeature; tier: 'A' | 'B' | 'C'; index: number }>;
     findVerticesByValue(column: string, predicate: ValuePredicate, options?: ValueQueryOptions):
         AsyncGenerator<IGeoJsonFeature>;
     findEdgesByText(column: string, query: string, options?: TextQueryOptions):
-        AsyncGenerator<{ edge: Edge; tier: 'A' | 'B' | 'C' }>;
+        AsyncGenerator<{ edge: Edge; tier: 'A' | 'B' | 'C'; index: number }>;
     findEdgesByValue(column: string, predicate: ValuePredicate, options?: ValueQueryOptions):
         AsyncGenerator<Edge>;
+
+    // Lookup → index helper (resolves to the storage index a single
+    // vertex matching `{ column, value }` exactly; throws on miss).
+    vertexIndexBy(lookup: { column: string; value: string | number | boolean }):
+        Promise<number>;
 
     // Whole-graph materialisation (warms caches, then returns the
     // same shape as the top-level `deserialize()` function).
@@ -578,8 +606,8 @@ class FlatGeoGraphBuf {
 
     // Pathfinding
     shortestPath(
-        from: number,
-        to: number,
+        from: number | { column: string; value: string | number | boolean },
+        to: number | { column: string; value: string | number | boolean },
         options?: ShortestPathOptions,
     ): Promise<ShortestPathResult | null>;
 

@@ -1,6 +1,6 @@
 {
     "name": "flatgeographbuf",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "description": "A performant binary encoding for geospatial graphs, extending FlatGeobuf with adjacency list support",
     "scripts": {
         "build": "rm lib -rf && swc ./src/ts -d lib/mjs && mv ./lib/mjs/src/ts/* ./lib/mjs -f && rm ./lib/mjs/src -rf && tsc --emitDeclarationOnly && rollup -c rollup.config.js",

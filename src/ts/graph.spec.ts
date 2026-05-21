@@ -916,7 +916,7 @@ describe('FlatGeoGraphBuf', () => {
             expect(receivedMeta.graph.edgeColumns[1].name).toBe('label');
         });
 
-        it('should return null graph metadata when no graph section', async () => {
+        it('reports an empty graph section when no edges were supplied', async () => {
             const geojson = makePointCollection(2);
             const bytes = serialize(geojson);
 
@@ -927,7 +927,13 @@ describe('FlatGeoGraphBuf', () => {
 
             expect(receivedMeta).not.toBeNull();
             expect(receivedMeta.features.featuresCount).toBe(2);
-            expect(receivedMeta.graph).toBeNull();
+            // 2.1.0+ always emits a graph section (possibly empty) so
+            // the reader's layout stays uniform across every file.
+            expect(receivedMeta.graph).not.toBeNull();
+            expect(receivedMeta.graph.edgeCount).toBe(0);
+            expect(receivedMeta.graph.hasAdjacencyIndex).toBe(false);
+            expect(receivedMeta.graph.hasEdgeIndex).toBe(false);
+            expect(receivedMeta.graph.hasEdgePropertyIndex).toBe(false);
         });
 
         it('should return null edgeColumns when edges have no properties', async () => {

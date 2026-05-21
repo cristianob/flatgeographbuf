@@ -2,34 +2,52 @@
 
 ## FlatGeoGraphBuf 2.1.0
 
-Property indices on vertex features and edges. Forward-compatible
-additions: 2.0.0 readers cannot open 2.1.0 files (they would land on
-the new vertex `indexFlags` byte without knowing to skip it), but
-2.1.0 readers can open 2.0.0 files if the writer used the new
-forward-compat-aware reader. Magic bytes unchanged at `0x02`.
+Property indices on vertex features and edges, plus a symmetric
+vertex-section indexFlags byte mirroring the graph section's
+flag-driven layout. **2.0.0 readers cannot open 2.1.0 files.** Magic
+bytes unchanged at `0x02`.
 
-### Vertex section gains a length-prefixed extras trailer
+### Vertex section reorganised around an indexFlags trailer
 
-After the optional vertex R-tree (or directly after the FlatBuffer
-header when `indexNodeSize == 0`):
+The vertex R-tree was previously placed between the FlatBuffer header
+and the features payload, with its presence implied by
+`header.indexNodeSize > 0`. In 2.1.0 the vertex section is fronted by
+a 1-byte `indexFlags` field, with optional blocks following in bit
+order:
 
 ```
-[vertex indexFlags: 1B]
-[vertex extras blocks: variable]
-[zero padding: 0–7B]    // pads the trailer to a multiple of 8 so the
-                        // features section stays Float64-aligned
+[Magic 8B][FB hdr size 4B][FB hdr]
+[vertex indexFlags 1B]
+[Vertex R-Tree?]            // bit 0x01; size from calcTreeSize
+[Vertex Property Index?]    // bit 0x02; length-prefixed
+[Future blocks...]          // length-prefixed; readers skip unknown bits
+[Padding to multiple of 8 bytes]
+[Features payload]
 ```
 
 `vertex indexFlags` bits:
 
 | Bit  | Meaning                                                  |
 |------|----------------------------------------------------------|
-| 0x01 | Vertex property index block follows (length-prefixed).   |
+| 0x01 | Vertex R-tree is present (not length-prefixed; size from `calcTreeSize`). |
+| 0x02 | Vertex property index block follows (length-prefixed).   |
 
-Unknown bits are honoured for forward compatibility: each set bit is
-expected to have a corresponding `[size: 4B][content: size bytes]`
-block, in bit order from LSB to MSB. Readers skip unknown blocks via
-the size prefix.
+`header.indexNodeSize` defines the R-tree's branching factor when
+bit `0x01` is set; ignored otherwise. The trailer's logical length
+plus padding is always a multiple of 8 bytes so the features section
+keeps its natural Float64 alignment (FlatBuffer geometry vectors
+require 8-byte alignment).
+
+Unknown bits are honoured for forward compatibility: each set bit
+beyond `0x01` is expected to have a corresponding
+`[size: 4B][content: size bytes]` block, in bit order from LSB to MSB.
+Readers skip unknown blocks via the size prefix.
+
+### Graph section is now always present
+
+Files with no edges still carry a graph section consisting of just an
+empty graph header (`edgeCount = 0`, no optional blocks). This keeps
+the reader's layout uniform: no "has graph section" branch.
 
 ### Graph section gains a new optional block
 

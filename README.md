@@ -346,20 +346,24 @@ const bytes = serialize(geojson, adjacency, {
 
 const fgg = await FlatGeoGraphBuf.open(bytes);
 
-// Text — tokenises the query, AND-intersects on token prefixes
-for await (const f of fgg.findVerticesByText('name', 'rio preto')) {
-    console.log(f.properties.name);
+// Text — tokenises the query, AND-intersects on token prefixes.
+// Each hit carries the matched feature plus a `tier` label
+// ('A' | 'B' | 'C') describing how well it matched.
+for await (const hit of fgg.findVerticesByText('name', 'rio preto')) {
+    console.log(hit.tier, hit.feature.properties.name);
 }
 
-// Numeric ranges
+// Numeric ranges — return features directly (no tier ranking)
 for await (const f of fgg.findVerticesByValue('elev_ft', { gte: 1000, lt: 5000 })) { … }
 for await (const f of fgg.findVerticesByValue('elev_ft', { eq: 1200 })) { … }
 
 // Booleans
 for await (const f of fgg.findVerticesByValue('intl', { eq: true })) { … }
 
-// Edges work the same way
-for await (const e of fgg.findEdgesByText('road', 'br-1')) { … }
+// Edges work the same way — text hits yield `{ edge, tier }`
+for await (const hit of fgg.findEdgesByText('road', 'br-1')) {
+    console.log(hit.tier, hit.edge.properties.road);
+}
 for await (const e of fgg.findEdgesByValue('km', { gt: 500 }, { limit: 10 })) { … }
 ```
 
@@ -373,14 +377,14 @@ for await (const e of fgg.findEdgesByValue('km', { gt: 500 }, { limit: 10 })) { 
   - `'prefix'` (default) — `"rio pre"` matches "São José do Rio **Pre**to".
   - `'token'` — each query token must be a full indexed token (no prefix). Use for code lookups like ICAO.
   - `'exact'` — the entire normalised query equals the entire indexed value's token sequence.
-- **Ranked output**:
-  1. Tier A — query tokens appear consecutive and in order
-  2. Tier B — in order with gaps
-  3. Tier C — present, any order
-  
-  Within a tier, earlier match position ranks first. Pass `{ limit: 20 }` for top-K.
+- **Ranked output**: hits come back in tier order then earliest match position. Each hit exposes its `tier`:
+  - **`'A'`** — query tokens appear consecutive and in the query's order
+  - **`'B'`** — in order with gaps
+  - **`'C'`** — present, possibly out of order
 
-**Composes with spatial filter**: collect results from `featuresInBbox` and `findVerticesByText` into Sets, then intersect.
+  Pass `{ limit: 20 }` for top-K truncation.
+
+**Composes with spatial filter**: collect results from `featuresInBbox` and `findVerticesByText` into Sets, then intersect (or use the hit's `feature` directly when joining).
 
 **Storage**: ~1.5 MB per text column for 50 k features × 2-3 words each, ~600 KB for numeric columns. Linear in the number of records × average tokens per value.
 
@@ -558,6 +562,20 @@ class FlatGeoGraphBuf {
     allEdges(): AsyncGenerator<Edge>;
     edgesInBbox(rect: Rect): AsyncGenerator<Edge>;
 
+    // Property-index queries
+    findVerticesByText(column: string, query: string, options?: TextQueryOptions):
+        AsyncGenerator<{ feature: IGeoJsonFeature; tier: 'A' | 'B' | 'C' }>;
+    findVerticesByValue(column: string, predicate: ValuePredicate, options?: ValueQueryOptions):
+        AsyncGenerator<IGeoJsonFeature>;
+    findEdgesByText(column: string, query: string, options?: TextQueryOptions):
+        AsyncGenerator<{ edge: Edge; tier: 'A' | 'B' | 'C' }>;
+    findEdgesByValue(column: string, predicate: ValuePredicate, options?: ValueQueryOptions):
+        AsyncGenerator<Edge>;
+
+    // Whole-graph materialisation (warms caches, then returns the
+    // same shape as the top-level `deserialize()` function).
+    toGeoJson(): Promise<{ features: IGeoJsonFeature[]; adjacencyList: AdjacencyList }>;
+
     // Pathfinding
     shortestPath(
         from: number,
@@ -569,6 +587,7 @@ class FlatGeoGraphBuf {
     loadFeatures(): Promise<IGeoJsonFeature[]>;
     loadEdges(): Promise<void>;
     loadIndices(): Promise<void>;
+    loadPropertyIndices(): Promise<void>;
     preload(): Promise<void>;
 
     // Synchronous cache release
@@ -576,6 +595,7 @@ class FlatGeoGraphBuf {
     releaseFeatures(): void;
     releaseEdges(): void;
     releaseIndices(): void;
+    releasePropertyIndices(): void;
 }
 ```
 

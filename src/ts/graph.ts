@@ -44,25 +44,33 @@ const GRAPH_INDEX_FLAG_KNOWN =
  *
  * Critically, this function never reads the feature payloads themselves.
  */
-// Vertex-section indexFlags bits (mirror the graph-section flag pattern
-// for symmetry). Lives in a single byte immediately after the optional
-// vertex R-tree; readers skip unknown bits via length prefixes.
-const VERTEX_INDEX_FLAG_PROPERTIES = 0x01;
-const VERTEX_INDEX_FLAG_KNOWN = VERTEX_INDEX_FLAG_PROPERTIES;
+// Vertex-section indexFlags bits, symmetric with the graph-section
+// flag pattern. The 1-byte indexFlags lives immediately after the
+// FlatBuffer header and precedes the optional vertex blocks
+// (R-tree, property index). Readers skip unknown bits via length
+// prefixes (note: the R-tree itself is NOT length-prefixed; its size
+// is calculated from `featuresCount` and `indexNodeSize`).
+const VERTEX_INDEX_FLAG_RTREE = 0x01;
+const VERTEX_INDEX_FLAG_PROPERTIES = 0x02;
+const VERTEX_INDEX_FLAG_KNOWN = VERTEX_INDEX_FLAG_RTREE | VERTEX_INDEX_FLAG_PROPERTIES;
 const VERTEX_INDEX_FLAGS_BYTE_LEN = 1;
 
 /**
  * Resolve the byte offsets of the vertex-section optional blocks and
- * the features payload start. Layout:
+ * the features payload start. Layout (symmetric with the graph
+ * section's flag → blocks layout):
  *
- *   [Vertex R-tree?]            (signalled by header.indexNodeSize > 0)
- *   [vertex indexFlags: 1B]     (always present)
- *   [Vertex Property Index?]    (length-prefixed; bit 0 of indexFlags)
+ *   [vertex indexFlags: 1B]    (always present)
+ *   [Vertex R-tree?]           (bit 0x01; size = calcTreeSize)
+ *   [Vertex Property Index?]   (bit 0x02; length-prefixed)
  *   …reserved future vertex blocks…
+ *   [Padding to multiple of 8 bytes]
  *   [Features payload]
  */
 export interface VertexLayout {
     vertexIndexFlags: number;
+    vertexRTreeStart: number | null;
+    vertexRTreeBytes: number;
     vertexPropertyIndexStart: number | null;
     vertexPropertyIndexBytes: number;
     unknownVertexIndexFlags: number;
@@ -71,32 +79,36 @@ export interface VertexLayout {
 
 export function locateVertexLayout(bytes: Uint8Array, header: HeaderMeta): VertexLayout {
     const headerLength = new DataView(bytes.buffer, bytes.byteOffset + magicbytes.length).getUint32(0, true);
-    let offset = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
-    if (header.indexNodeSize > 0 && header.featuresCount > 0) {
-        offset += calcTreeSize(header.featuresCount, header.indexNodeSize);
-    }
-    const extrasStart = offset;
+    const extrasStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
+    let offset = extrasStart;
 
     const indexFlags = bytes[offset];
     offset += VERTEX_INDEX_FLAGS_BYTE_LEN;
 
-    const readBlockSize = (): number =>
-        new DataView(bytes.buffer, bytes.byteOffset + offset).getUint32(0, true);
+    let vertexRTreeStart: number | null = null;
+    let vertexRTreeBytes = 0;
+    if ((indexFlags & VERTEX_INDEX_FLAG_RTREE) !== 0 && header.featuresCount > 0) {
+        const treeSize = calcTreeSize(header.featuresCount, header.indexNodeSize || 16);
+        vertexRTreeStart = offset;
+        vertexRTreeBytes = treeSize;
+        offset += treeSize;
+    }
 
     let vertexPropertyIndexStart: number | null = null;
     let vertexPropertyIndexBytes = 0;
     if ((indexFlags & VERTEX_INDEX_FLAG_PROPERTIES) !== 0) {
-        const size = readBlockSize();
+        const size = new DataView(bytes.buffer, bytes.byteOffset + offset).getUint32(0, true);
         vertexPropertyIndexStart = offset + SIZE_PREFIX_LEN;
         vertexPropertyIndexBytes = size;
         offset += SIZE_PREFIX_LEN + size;
     }
 
-    // Forward-compat: walk any blocks whose flag bit we don't recognise.
+    // Forward-compat: walk any blocks whose flag bit we don't recognise
+    // (length-prefixed by convention for any future bit).
     let unknown = indexFlags & ~VERTEX_INDEX_FLAG_KNOWN;
     const unknownFlags = unknown;
     while (unknown !== 0) {
-        const size = readBlockSize();
+        const size = new DataView(bytes.buffer, bytes.byteOffset + offset).getUint32(0, true);
         offset += SIZE_PREFIX_LEN + size;
         unknown &= unknown - 1;
     }
@@ -108,6 +120,8 @@ export function locateVertexLayout(bytes: Uint8Array, header: HeaderMeta): Verte
 
     return {
         vertexIndexFlags: indexFlags,
+        vertexRTreeStart,
+        vertexRTreeBytes,
         vertexPropertyIndexStart,
         vertexPropertyIndexBytes,
         unknownVertexIndexFlags: unknownFlags,
@@ -115,41 +129,50 @@ export function locateVertexLayout(bytes: Uint8Array, header: HeaderMeta): Verte
     };
 }
 
-/** Build the vertex-section trailer (1B flags + optional blocks).
- *  `vertexPropertyIndex`, when present, is expected to already include
- *  its 4-byte size prefix (same convention as `buildAdjacencyBlock`).
+/** Build the vertex-section trailer (1B flags + optional blocks in
+ *  bit order). `vertexRTree` is emitted raw (not length-prefixed —
+ *  its size is recoverable from `featuresCount × nodeSize`).
+ *  `vertexPropertyIndex`, when present, already includes its 4-byte
+ *  size prefix (same convention as `buildAdjacencyBlock`).
  *  The emitted size is padded to a multiple of 8 so the features
  *  section that follows keeps its natural Float64 alignment. */
-export function buildVertexExtras(vertexPropertyIndex: Uint8Array | null): Uint8Array {
+export function buildVertexExtras(
+    vertexRTree: Uint8Array | null,
+    vertexPropertyIndex: Uint8Array | null,
+): Uint8Array {
     let flags = 0;
+    if (vertexRTree) flags |= VERTEX_INDEX_FLAG_RTREE;
     if (vertexPropertyIndex) flags |= VERTEX_INDEX_FLAG_PROPERTIES;
     const logicalLen =
-        VERTEX_INDEX_FLAGS_BYTE_LEN + (vertexPropertyIndex ? vertexPropertyIndex.byteLength : 0);
+        VERTEX_INDEX_FLAGS_BYTE_LEN +
+        (vertexRTree ? vertexRTree.byteLength : 0) +
+        (vertexPropertyIndex ? vertexPropertyIndex.byteLength : 0);
     const paddedLen = (logicalLen + 7) & ~7;
     const buf = new Uint8Array(paddedLen);
     buf[0] = flags;
+    let cursor = VERTEX_INDEX_FLAGS_BYTE_LEN;
+    if (vertexRTree) {
+        buf.set(vertexRTree, cursor);
+        cursor += vertexRTree.byteLength;
+    }
     if (vertexPropertyIndex) {
-        buf.set(vertexPropertyIndex, VERTEX_INDEX_FLAGS_BYTE_LEN);
+        buf.set(vertexPropertyIndex, cursor);
     }
     return buf;
 }
 
 export function findGraphSectionStart(bytes: Uint8Array, header: HeaderMeta): number {
-    const { featuresStart } = locateVertexLayout(bytes, header);
-    let offset = featuresStart;
+    const layout = locateVertexLayout(bytes, header);
+    let offset = layout.featuresStart;
 
     if (header.featuresCount === 0) return offset;
 
-    if (header.indexNodeSize > 0) {
+    if (layout.vertexRTreeStart !== null) {
         // R-tree present → use its last leaf to locate the last feature
         // in O(1) reads.
-        const headerLength = new DataView(bytes.buffer, bytes.byteOffset + magicbytes.length).getUint32(
-            0,
-            true,
-        );
-        const treeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
-        const treeSize = calcTreeSize(header.featuresCount, header.indexNodeSize);
-        if (featuresStart >= bytes.length) return bytes.length;
+        const treeStart = layout.vertexRTreeStart;
+        const treeSize = layout.vertexRTreeBytes;
+        if (layout.featuresStart >= bytes.length) return bytes.length;
 
         const totalNodes = treeSize / NODE_ITEM_BYTE_LEN;
         const lastLeafPos = treeStart + (totalNodes - 1) * NODE_ITEM_BYTE_LEN;
@@ -157,7 +180,7 @@ export function findGraphSectionStart(bytes: Uint8Array, header: HeaderMeta): nu
 
         const leafView = new DataView(bytes.buffer, bytes.byteOffset + lastLeafPos + 32);
         const lastFeatureRelOffset = Number(leafView.getBigUint64(0, true));
-        const lastFeatureAbsPos = featuresStart + lastFeatureRelOffset;
+        const lastFeatureAbsPos = layout.featuresStart + lastFeatureRelOffset;
         if (lastFeatureAbsPos + SIZE_PREFIX_LEN > bytes.length) return bytes.length;
 
         const lastFeatureSize = new DataView(bytes.buffer, bytes.byteOffset + lastFeatureAbsPos).getUint32(

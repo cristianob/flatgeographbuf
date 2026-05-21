@@ -137,4 +137,59 @@ mkdirSync(OUT_DIR, { recursive: true });
     console.log(`✓ no-indices.fgg      ${bytes.byteLength} bytes`);
 }
 
+// ─── Fixture 4: minimal.fgg ───────────────────────────────────────────
+// Smallest possible FGG file: a single vertex, no edges, no indices at
+// all. Used to verify the absolute-minimum format handshake.
+{
+    const geojson: FeatureCollection = {
+        type: 'FeatureCollection',
+        features: [
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [0, 0] }, properties: {} },
+        ],
+    };
+    const bytes = serialize(geojson, undefined, {
+        writeIndex: false,
+        writeAdjacencyIndex: false,
+        writeEdgeIndex: false,
+    });
+    writeFileSync(resolve(OUT_DIR, 'minimal.fgg'), bytes);
+    console.log(`✓ minimal.fgg         ${bytes.byteLength} bytes`);
+}
+
+// ─── Fixture 5: maximal.fgg ───────────────────────────────────────────
+// Every index turned on, every property-column type represented on
+// both vertices and edges. Stresses the most complex file we can
+// produce.
+{
+    const geojson: FeatureCollection = {
+        type: 'FeatureCollection',
+        features: [
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [-46.63, -23.55] }, properties: { name: 'São Paulo', icao: 'SBSP', elev_ft: 2461, intl: true } },
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [-43.17, -22.91] }, properties: { name: 'Rio de Janeiro', icao: 'SBRJ', elev_ft: 11, intl: false } },
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [-47.93, -15.78] }, properties: { name: 'Brasília', icao: 'SBBR', elev_ft: 3497, intl: true } },
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [-49.27, -16.68] }, properties: { name: 'São José do Rio Preto', icao: 'SBSR', elev_ft: 1784, intl: false } },
+            { type: 'Feature', geometry: { type: 'Point', coordinates: [-44.20, -22.30] }, properties: { name: 'Rio Preto', icao: 'SDRP', elev_ft: 100, intl: false } },
+        ],
+    };
+    const adjacency: AdjacencyListInput = {
+        edges: [
+            { from: 0, to: 1, properties: { road: 'BR-116', km: 429, paved: true } },
+            { from: 0, to: 2, properties: { road: 'BR-050', km: 1015, paved: true } },
+            { from: 0, to: 3, properties: { road: 'BR-153', km: 442, paved: true } },
+            { from: 3, to: 4, properties: { road: 'BR-101', km: 770, paved: false } },
+        ],
+    };
+    const bytes = serialize(geojson, adjacency, {
+        writeIndex: true,
+        writeAdjacencyIndex: true,
+        writeEdgeIndex: true,
+        columnIndex: {
+            vertices: ['name', 'icao', 'elev_ft', 'intl'],
+            edges: ['road', 'km', 'paved'],
+        },
+    });
+    writeFileSync(resolve(OUT_DIR, 'maximal.fgg'), bytes);
+    console.log(`✓ maximal.fgg         ${bytes.byteLength} bytes`);
+}
+
 console.log(`\nFixtures written to ${OUT_DIR}`);

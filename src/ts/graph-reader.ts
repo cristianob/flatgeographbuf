@@ -4,7 +4,7 @@ import { isValidMagicBytes, magicbytes, SIZE_PREFIX_LEN } from './constants.js';
 import { Feature } from './flat-geobuf/feature.js';
 import { fromFeature, type IGeoJsonFeature } from './geojson/feature.js';
 import { parseEdge, parseGraphSectionLayout, type GraphSectionLayout } from './graph.js';
-import type { Edge, FeaturesHeaderMeta } from './graph-types.js';
+import type { DeserializeGraphResult, Edge, FeaturesHeaderMeta } from './graph-types.js';
 import { fromByteBuffer, type HeaderMeta } from './header-meta.js';
 import { calcTreeSize, DEFAULT_NODE_SIZE, NODE_ITEM_BYTE_LEN, type Rect, streamSearch } from './packedrtree.js';
 import {
@@ -17,6 +17,17 @@ import {
     type ValuePredicate,
     type ValueQueryOptions,
 } from './property-index.js';
+
+/** Result yielded by `findVerticesByText` / `findEdgesByText`. `tier`
+ *  reflects how the candidate matched the query:
+ *  - `'A'`: query tokens appear consecutive and in the query's order
+ *  - `'B'`: query tokens appear in order with gaps
+ *  - `'C'`: query tokens all present, possibly out of order
+ *  Results are emitted in tier order (A → B → C), then by earliest
+ *  matched position. */
+export type TextHit<T, Key extends 'feature' | 'edge' = 'feature'> = Key extends 'edge'
+    ? { edge: T; tier: 'A' | 'B' | 'C' }
+    : { feature: T; tier: 'A' | 'B' | 'C' };
 import { runShortestPath, type ShortestPathOptions, type ShortestPathResult } from './shortest-path.js';
 
 /**
@@ -126,7 +137,6 @@ export class FlatGeoGraphBuf {
 
         const located = await locateGraphSection(reader, featureHeader);
         const layout = await readGraphLayout(reader, located.graphStart);
-        const vertexRTreeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
 
         return new FlatGeoGraphBuf(
             reader,
@@ -134,7 +144,7 @@ export class FlatGeoGraphBuf {
             layout,
             located.featuresStart,
             located.featuresLength,
-            vertexRTreeStart,
+            located.vertexRTreeStart ?? -1,
             located.vertexPropertyIndexStart,
             located.vertexPropertyIndexBytes,
         );
@@ -225,6 +235,23 @@ export class FlatGeoGraphBuf {
             this.featureCache.set(featureIdx, feature);
             yield feature;
         }
+    }
+
+    /**
+     * Build a GeoJSON-compatible representation of the entire graph,
+     * mirroring the shape returned by the top-level `deserialize()`
+     * function (`{ features, adjacencyList }`).
+     *
+     * Calls `loadFeatures()` and `loadEdges()` to make sure every
+     * vertex and edge is in memory, then assembles the result. The
+     * returned objects are references to the same parsed values held
+     * in the caches; mutating them mutates the cache.
+     */
+    async toGeoJson(): Promise<DeserializeGraphResult<IGeoJsonFeature>> {
+        const features = await this.loadFeatures();
+        const edges: Edge[] = [];
+        for await (const edge of this.allEdges()) edges.push(edge);
+        return { features, adjacencyList: { edges } };
     }
 
     /**
@@ -408,12 +435,14 @@ export class FlatGeoGraphBuf {
         column: string,
         query: string,
         options?: TextQueryOptions,
-    ): AsyncGenerator<IGeoJsonFeature, void, unknown> {
+    ): AsyncGenerator<TextHit<IGeoJsonFeature>, void, unknown> {
         const idx = await this.requirePropertyIndex('vertex');
         const col = idx.text.get(column);
         if (!col) throw new Error(`Vertex column "${column}" is not indexed as text`);
         const hits = searchText(col, query, options);
-        for (const hit of hits) yield await this.getFeature(hit.recordId);
+        for (const hit of hits) {
+            yield { feature: await this.getFeature(hit.recordId), tier: hit.tier };
+        }
     }
 
     /**
@@ -449,12 +478,14 @@ export class FlatGeoGraphBuf {
         column: string,
         query: string,
         options?: TextQueryOptions,
-    ): AsyncGenerator<Edge, void, unknown> {
+    ): AsyncGenerator<TextHit<Edge, 'edge'>, void, unknown> {
         const idx = await this.requirePropertyIndex('edge');
         const col = idx.text.get(column);
         if (!col) throw new Error(`Edge column "${column}" is not indexed as text`);
         const hits = searchText(col, query, options);
-        for (const hit of hits) yield await this.getEdgeByStorageIndex(hit.recordId);
+        for (const hit of hits) {
+            yield { edge: await this.getEdgeByStorageIndex(hit.recordId), tier: hit.tier };
+        }
     }
 
     async *findEdgesByValue(
@@ -615,6 +646,8 @@ export class FlatGeoGraphBuf {
         );
         this.adjacencyOffsetsBytes = csrBytes;
         const csrView = new DataView(csrBytes.buffer, csrBytes.byteOffset);
+        const edgesView = new DataView(this.edgesSectionBytes.buffer, this.edgesSectionBytes.byteOffset);
+        const edgeColumns = this.layout.header.edgeColumns;
 
         for (let v = 0; v < this.featureCount; v++) {
             const start = csrView.getUint32(v * 4, true);
@@ -626,17 +659,8 @@ export class FlatGeoGraphBuf {
             const edges: Edge[] = [];
             let cursor = start;
             while (cursor < end) {
-                const size = new DataView(
-                    this.edgesSectionBytes.buffer,
-                    this.edgesSectionBytes.byteOffset + cursor,
-                ).getUint32(0, true);
-                const edge = parseEdge(
-                    this.edgesSectionBytes,
-                    cursor + SIZE_PREFIX_LEN,
-                    size,
-                    this.layout.header.edgeColumns,
-                );
-                edges.push(edge);
+                const size = edgesView.getUint32(cursor, true);
+                edges.push(parseEdge(this.edgesSectionBytes, cursor + SIZE_PREFIX_LEN, size, edgeColumns));
                 cursor += SIZE_PREFIX_LEN + size;
             }
             this.outgoingEdgesCache.set(v, edges);
@@ -738,7 +762,6 @@ export class FlatGeoGraphBuf {
             return;
         }
         await this.preloadSingleRequest();
-        await this.loadPropertyIndices();
     }
 
     /**
@@ -747,16 +770,15 @@ export class FlatGeoGraphBuf {
      * `readAll()` (single-request path).
      */
     private populateAllCachesFromFullBuffer(all: Uint8Array): void {
-        if (this.featureHeader.indexNodeSize > 0 && this.featureCount > 0) {
-            const headerLength = new DataView(all.buffer, all.byteOffset + magicbytes.length).getUint32(
-                0,
-                true,
+        if (this.vertexRTreeStart >= 0 && this.featureCount > 0) {
+            const treeSize = calcTreeSize(
+                this.featureCount,
+                this.featureHeader.indexNodeSize || 16,
             );
-            const treeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
-            const treeSize = this.featuresStart - treeStart;
-            if (treeSize > 0) {
-                this.vertexRTreeBytes = all.subarray(treeStart, treeStart + treeSize);
-            }
+            this.vertexRTreeBytes = all.subarray(
+                this.vertexRTreeStart,
+                this.vertexRTreeStart + treeSize,
+            );
         }
 
         if (this.layout.edgeRTreeStart !== null && this.layout.edgeRTreeBytes > 0) {
@@ -767,12 +789,10 @@ export class FlatGeoGraphBuf {
         }
 
         const featuresSection = all.subarray(this.featuresStart, this.featuresStart + this.featuresLength);
+        const featuresView = new DataView(featuresSection.buffer, featuresSection.byteOffset);
         let cursor = 0;
         for (let i = 0; i < this.featureCount; i++) {
-            const size = new DataView(
-                featuresSection.buffer,
-                featuresSection.byteOffset + cursor,
-            ).getUint32(0, true);
+            const size = featuresView.getUint32(cursor, true);
             const featureBytes = featuresSection.subarray(cursor, cursor + SIZE_PREFIX_LEN + size);
             this.featureCache.set(i, parseFeatureBytes(featureBytes, this.featureHeader));
             cursor += SIZE_PREFIX_LEN + size;
@@ -780,6 +800,7 @@ export class FlatGeoGraphBuf {
 
         if (this.layout.header.edgeCount > 0) {
             this.edgesSectionBytes = all.subarray(this.layout.edgesStart);
+            const edgesView = new DataView(this.edgesSectionBytes.buffer, this.edgesSectionBytes.byteOffset);
             if (this.layout.adjacencyOffsetsStart !== null) {
                 const adjStart = this.layout.adjacencyOffsetsStart;
                 const csrSlice = all.subarray(adjStart, adjStart + (this.featureCount + 1) * 4);
@@ -795,17 +816,15 @@ export class FlatGeoGraphBuf {
                     const edges: Edge[] = [];
                     let edgeCursor = start;
                     while (edgeCursor < end) {
-                        const size = new DataView(
-                            this.edgesSectionBytes.buffer,
-                            this.edgesSectionBytes.byteOffset + edgeCursor,
-                        ).getUint32(0, true);
-                        const edge = parseEdge(
-                            this.edgesSectionBytes,
-                            edgeCursor + SIZE_PREFIX_LEN,
-                            size,
-                            this.layout.header.edgeColumns,
+                        const size = edgesView.getUint32(edgeCursor, true);
+                        edges.push(
+                            parseEdge(
+                                this.edgesSectionBytes,
+                                edgeCursor + SIZE_PREFIX_LEN,
+                                size,
+                                this.layout.header.edgeColumns,
+                            ),
                         );
-                        edges.push(edge);
                         edgeCursor += SIZE_PREFIX_LEN + size;
                     }
                     this.outgoingEdgesCache.set(v, edges);
@@ -813,8 +832,6 @@ export class FlatGeoGraphBuf {
             }
         }
 
-        // Property indices: parse from the in-memory buffer without
-        // any further I/O.
         if (this.vertexPropertyIndexStart !== null) {
             const start = this.vertexPropertyIndexStart;
             this.vertexPropertyIndex = parsePropertyIndexBlock(
@@ -836,9 +853,7 @@ export class FlatGeoGraphBuf {
     private async preloadSingleRequest(): Promise<void> {
         const adjStart = this.layout.adjacencyOffsetsStart as number;
 
-        // Find the edges section length via the CSR sentinel
-        // `offsets[N]` (a 4-byte read). The end of that section is the
-        // end of the FGG file's meaningful content.
+        // CSR sentinel `offsets[N]` reports the edges section length.
         const sentinelBytes = await this.reader.read(adjStart + this.featureCount * 4, SIZE_PREFIX_LEN);
         const edgesSectionLength = new DataView(
             sentinelBytes.buffer,
@@ -848,16 +863,15 @@ export class FlatGeoGraphBuf {
 
         const all = await this.reader.read(0, endOffset);
 
-        // Slice into each cache without copying — Uint8Array views share
-        // the underlying ArrayBuffer of `all`.
-        const headerLength = new DataView(all.buffer, all.byteOffset + magicbytes.length).getUint32(
-            0,
-            true,
-        );
-        const treeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
-        const treeSize = this.featuresStart - treeStart;
-        if (this.featureHeader.indexNodeSize > 0 && treeSize > 0) {
-            this.vertexRTreeBytes = all.subarray(treeStart, treeStart + treeSize);
+        if (this.vertexRTreeStart >= 0 && this.featureCount > 0) {
+            const treeSize = calcTreeSize(
+                this.featureCount,
+                this.featureHeader.indexNodeSize || 16,
+            );
+            this.vertexRTreeBytes = all.subarray(
+                this.vertexRTreeStart,
+                this.vertexRTreeStart + treeSize,
+            );
         }
         if (this.layout.edgeRTreeStart !== null && this.layout.edgeRTreeBytes > 0) {
             this.edgeRTreeBytes = all.subarray(
@@ -866,23 +880,22 @@ export class FlatGeoGraphBuf {
             );
         }
         this.edgesSectionBytes = all.subarray(this.layout.edgesStart, this.layout.edgesStart + edgesSectionLength);
+        const edgesView = new DataView(this.edgesSectionBytes.buffer, this.edgesSectionBytes.byteOffset);
 
         const featuresSection = all.subarray(this.featuresStart, this.featuresStart + this.featuresLength);
+        const featuresView = new DataView(featuresSection.buffer, featuresSection.byteOffset);
         let cursor = 0;
         for (let i = 0; i < this.featureCount; i++) {
-            const size = new DataView(
-                featuresSection.buffer,
-                featuresSection.byteOffset + cursor,
-            ).getUint32(0, true);
+            const size = featuresView.getUint32(cursor, true);
             const featureBytes = featuresSection.subarray(cursor, cursor + SIZE_PREFIX_LEN + size);
-            const feature = parseFeatureBytes(featureBytes, this.featureHeader);
-            this.featureCache.set(i, feature);
+            this.featureCache.set(i, parseFeatureBytes(featureBytes, this.featureHeader));
             cursor += SIZE_PREFIX_LEN + size;
         }
 
         const csrSlice = all.subarray(adjStart, adjStart + (this.featureCount + 1) * 4);
         this.adjacencyOffsetsBytes = csrSlice;
         const csrView = new DataView(csrSlice.buffer, csrSlice.byteOffset);
+        const edgeColumns = this.layout.header.edgeColumns;
         for (let v = 0; v < this.featureCount; v++) {
             const start = csrView.getUint32(v * 4, true);
             const end = csrView.getUint32((v + 1) * 4, true);
@@ -893,26 +906,30 @@ export class FlatGeoGraphBuf {
             const edges: Edge[] = [];
             let edgeCursor = start;
             while (edgeCursor < end) {
-                const size = new DataView(
-                    this.edgesSectionBytes.buffer,
-                    this.edgesSectionBytes.byteOffset + edgeCursor,
-                ).getUint32(0, true);
-                const edge = parseEdge(
-                    this.edgesSectionBytes,
-                    edgeCursor + SIZE_PREFIX_LEN,
-                    size,
-                    this.layout.header.edgeColumns,
-                );
-                edges.push(edge);
+                const size = edgesView.getUint32(edgeCursor, true);
+                edges.push(parseEdge(this.edgesSectionBytes, edgeCursor + SIZE_PREFIX_LEN, size, edgeColumns));
                 edgeCursor += SIZE_PREFIX_LEN + size;
             }
             this.outgoingEdgesCache.set(v, edges);
+        }
+
+        if (this.vertexPropertyIndexStart !== null) {
+            const start = this.vertexPropertyIndexStart;
+            this.vertexPropertyIndex = parsePropertyIndexBlock(
+                all.subarray(start, start + this.vertexPropertyIndexBytes),
+            );
+        }
+        if (this.layout.edgePropertyIndexStart !== null) {
+            const start = this.layout.edgePropertyIndexStart;
+            this.edgePropertyIndex = parsePropertyIndexBlock(
+                all.subarray(start, start + this.layout.edgePropertyIndexBytes),
+            );
         }
     }
 
     /**
      * Drop **every** in-memory cache (features, outgoing edges, edges
-     * section bytes, R-trees). Subsequent queries
+     * section bytes, R-trees, property indices). Subsequent queries
      * fall back to lazy reads through the underlying `ByteReader` just
      * as if the instance had been freshly opened.
      *
@@ -1048,11 +1065,15 @@ export class FlatGeoGraphBuf {
      * obtained by reading the corresponding R-tree leaf node. Only valid
      * when `featureHeader.indexNodeSize > 0`.
      */
+    private vertexRTreeFirstLeafOffsetCache: number | null = null;
+
     private async featureOffsetViaRTree(index: number): Promise<number> {
-        const treeSize = calcTreeSize(this.featureCount, this.featureHeader.indexNodeSize);
-        const totalNodes = treeSize / NODE_ITEM_BYTE_LEN;
-        const leafIdx = totalNodes - this.featureCount + index;
-        const leafByteOffset = leafIdx * NODE_ITEM_BYTE_LEN + 32;
+        if (this.vertexRTreeFirstLeafOffsetCache === null) {
+            const treeSize = calcTreeSize(this.featureCount, this.featureHeader.indexNodeSize);
+            const totalNodes = treeSize / NODE_ITEM_BYTE_LEN;
+            this.vertexRTreeFirstLeafOffsetCache = (totalNodes - this.featureCount) * NODE_ITEM_BYTE_LEN + 32;
+        }
+        const leafByteOffset = this.vertexRTreeFirstLeafOffsetCache + index * NODE_ITEM_BYTE_LEN;
         if (this.vertexRTreeBytes !== null) {
             return Number(
                 new DataView(
@@ -1084,6 +1105,7 @@ interface LocatedSections {
     featuresStart: number;
     featuresLength: number;
     graphStart: number;
+    vertexRTreeStart: number | null;
     vertexPropertyIndexStart: number | null;
     vertexPropertyIndexBytes: number;
 }
@@ -1092,27 +1114,30 @@ async function locateGraphSection(reader: ByteReader, header: HeaderMeta): Promi
     const headerLengthBytes = await reader.read(magicbytes.length, SIZE_PREFIX_LEN);
     const headerLength = new DataView(headerLengthBytes.buffer, headerLengthBytes.byteOffset).getUint32(0, true);
 
-    const treeStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
-    let vertexExtrasStart = treeStart;
-    if (header.indexNodeSize > 0 && header.featuresCount > 0) {
-        vertexExtrasStart += calcTreeSize(header.featuresCount, header.indexNodeSize);
+    const extrasStart = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
+    const flagsBytes = await reader.read(extrasStart, 1);
+    const vertexIndexFlags = flagsBytes[0];
+    let cursor = extrasStart + 1;
+
+    let vertexRTreeStart: number | null = null;
+    let treeSize = 0;
+    if ((vertexIndexFlags & 0x01) !== 0 && header.featuresCount > 0) {
+        treeSize = calcTreeSize(header.featuresCount, header.indexNodeSize || 16);
+        vertexRTreeStart = cursor;
+        cursor += treeSize;
     }
 
-    // Parse the 1-byte vertex indexFlags and any optional vertex blocks.
-    const flagsBytes = await reader.read(vertexExtrasStart, 1);
-    const vertexIndexFlags = flagsBytes[0];
-    let cursor = vertexExtrasStart + 1;
     let vertexPropertyIndexStart: number | null = null;
     let vertexPropertyIndexBytes = 0;
-    if ((vertexIndexFlags & 0x01) !== 0) {
+    if ((vertexIndexFlags & 0x02) !== 0) {
         const sizeBytes = await reader.read(cursor, SIZE_PREFIX_LEN);
         const size = new DataView(sizeBytes.buffer, sizeBytes.byteOffset).getUint32(0, true);
         vertexPropertyIndexStart = cursor + SIZE_PREFIX_LEN;
         vertexPropertyIndexBytes = size;
         cursor += SIZE_PREFIX_LEN + size;
     }
-    // Forward-compat: skip unknown vertex extras blocks
-    let unknown = vertexIndexFlags & ~0x01;
+    // Forward-compat: skip unknown length-prefixed vertex extras blocks.
+    let unknown = vertexIndexFlags & ~0x03;
     while (unknown !== 0) {
         const sizeBytes = await reader.read(cursor, SIZE_PREFIX_LEN);
         const size = new DataView(sizeBytes.buffer, sizeBytes.byteOffset).getUint32(0, true);
@@ -1120,8 +1145,8 @@ async function locateGraphSection(reader: ByteReader, header: HeaderMeta): Promi
         unknown &= unknown - 1;
     }
     // Round up to multiple of 8 for the writer's alignment padding.
-    const logicalLen = cursor - vertexExtrasStart;
-    cursor = vertexExtrasStart + ((logicalLen + 7) & ~7);
+    const logicalLen = cursor - extrasStart;
+    cursor = extrasStart + ((logicalLen + 7) & ~7);
     const featuresStart = cursor;
 
     if (header.featuresCount === 0) {
@@ -1129,18 +1154,18 @@ async function locateGraphSection(reader: ByteReader, header: HeaderMeta): Promi
             featuresStart,
             featuresLength: 0,
             graphStart: featuresStart,
+            vertexRTreeStart,
             vertexPropertyIndexStart,
             vertexPropertyIndexBytes,
         };
     }
 
-    if (header.indexNodeSize > 0) {
-        const treeSize = calcTreeSize(header.featuresCount, header.indexNodeSize);
+    if (vertexRTreeStart !== null) {
         const totalNodes = treeSize / NODE_ITEM_BYTE_LEN;
         // The writer stores features in Hilbert order, so the last leaf
         // in the R-tree is the physically last feature.
         const lastLeafBytes = await reader.read(
-            treeStart + (totalNodes - 1) * NODE_ITEM_BYTE_LEN + 32,
+            vertexRTreeStart + (totalNodes - 1) * NODE_ITEM_BYTE_LEN + 32,
             8,
         );
         const lastFeatureRelOffset = Number(
@@ -1153,6 +1178,7 @@ async function locateGraphSection(reader: ByteReader, header: HeaderMeta): Promi
             featuresStart,
             featuresLength,
             graphStart: featuresStart + featuresLength,
+            vertexRTreeStart,
             vertexPropertyIndexStart,
             vertexPropertyIndexBytes,
         };
@@ -1170,6 +1196,7 @@ async function locateGraphSection(reader: ByteReader, header: HeaderMeta): Promi
         featuresStart,
         featuresLength: walkCursor,
         graphStart: featuresStart + walkCursor,
+        vertexRTreeStart,
         vertexPropertyIndexStart,
         vertexPropertyIndexBytes,
     };

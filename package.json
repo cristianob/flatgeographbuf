@@ -25,6 +25,9 @@
     "module": "lib/mjs/flatgeographbuf.js",
     "main": "lib/mjs/flatgeographbuf.js",
     "type": "module",
+    "engines": {
+        "node": ">=18"
+    },
     "exports": {
         ".": {
             "types": "./lib/mjs/flatgeographbuf.d.ts",

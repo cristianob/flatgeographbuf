@@ -65,25 +65,32 @@ export class ArrayReader {
     }
 
     private lengthBeforeTree(): number {
-        return magicbytes.length + SIZE_PREFIX_LEN + this.headerLength;
+        // Layout: header → vertex indexFlags (1B) → optional R-tree.
+        // The R-tree itself starts AFTER the indexFlags byte when bit
+        // 0x01 is set; when absent there is no R-tree to skip.
+        const extrasStart = magicbytes.length + SIZE_PREFIX_LEN + this.headerLength;
+        return extrasStart + 1;
     }
 
     private lengthBeforeFeatures(): number {
-        const afterTree = this.lengthBeforeTree() + this.indexLength;
-        // Skip the FGG vertex-extras trailer: 1B indexFlags + per-bit
-        // length-prefixed blocks, padded to multiple of 8.
-        let offset = afterTree;
+        const extrasStart = magicbytes.length + SIZE_PREFIX_LEN + this.headerLength;
+        let offset = extrasStart;
         const indexFlags = this.bytes[offset];
         offset += 1;
+        if ((indexFlags & 0x01) !== 0) offset += this.indexLength;
         const view = new DataView(this.bytes.buffer, this.bytes.byteOffset);
-        let unknown = indexFlags;
+        if ((indexFlags & 0x02) !== 0) {
+            const size = view.getUint32(offset, true);
+            offset += SIZE_PREFIX_LEN + size;
+        }
+        let unknown = indexFlags & ~0x03;
         while (unknown !== 0) {
             const size = view.getUint32(offset, true);
             offset += SIZE_PREFIX_LEN + size;
             unknown &= unknown - 1;
         }
-        const logicalLen = offset - afterTree;
-        return afterTree + ((logicalLen + 7) & ~7);
+        const logicalLen = offset - extrasStart;
+        return extrasStart + ((logicalLen + 7) & ~7);
     }
 
     private readFeature(featureOffset: number): Feature {

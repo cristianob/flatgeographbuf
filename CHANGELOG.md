@@ -5,7 +5,69 @@ follows [Keep a Changelog](https://keepachangelog.com/). Wire-format
 changes are tracked separately in
 [`doc/format-changelog.md`](doc/format-changelog.md).
 
-## 2.1.0
+## 2.1.0 (unreleased)
+
+### Wire format (compared to 2.0.0)
+
+- Vertex section restructured into a length-prefixed-on-demand extras
+  trailer with a 1-byte `indexFlags` byte. Bit `0x01` now signals the
+  vertex R-tree (previously implied by `header.indexNodeSize > 0`); bit
+  `0x02` signals the vertex property index block. The trailer is
+  padded to a multiple of 8 bytes so the features payload stays
+  Float64-aligned. Mirrors the graph section's flag-driven layout for
+  symmetry across both sides of the file. **2.0.0 readers cannot
+  open 2.1.0 files.**
+- Graph section's `indexFlags` gains bit `0x04` for the edge property
+  index block, sitting between the edge R-tree and the edges payload.
+- Both `indexFlags` bytes are forward-compatible: optional blocks
+  beyond the documented bits MUST be length-prefixed so older readers
+  can skip them via the leading 4-byte size.
+- The graph section is now **always** present in every file (even
+  edge-less ones); it then contains just an empty graph header.
+
+### Reader API
+
+- New `FlatGeoGraphBuf.toGeoJson()` method materialises the entire
+  graph as the same `{ features, adjacencyList }` shape returned by
+  the top-level `deserialize()`. Warms caches if not already loaded.
+- New `TextHit` return shape for text queries: `findVerticesByText`
+  yields `{ feature, tier: 'A' | 'B' | 'C' }`, `findEdgesByText`
+  yields `{ edge, tier }`. `tier` reflects how the candidate matched
+  (A: consecutive in order; B: in order with gaps; C: any order).
+- `findVerticesByValue` / `findEdgesByValue` still yield the
+  feature/edge directly (numeric and boolean predicates don't rank).
+- `preloadSingleRequest()` (the CSR-driven single-bulk-read path)
+  now populates the vertex and edge property indices from the same
+  buffer, eliminating an extra round trip.
+- `isValidMagicBytes()` now enforces the major version byte (`0x02`).
+  Files with any other version byte are rejected at `open()`.
+
+### Performance
+
+- Hot loops in `populateAllCachesFromFullBuffer` and
+  `preloadSingleRequest` reuse a single `DataView` over the features
+  and edges sections instead of allocating one per size-prefix read.
+- `featureOffsetViaRTree` caches the offset of the first R-tree leaf
+  on first call.
+- Property index parser copies into freshly aligned typed-array
+  buffers (no in-place views on misaligned subarrays).
+
+### Tests
+
+- 64 × 11 = 704 permutation assertions covering every combination of
+  the 5 writer flags and the "has edges" data dimension.
+- 22 robustness cases (corrupted property index blocks, bad magic,
+  empty / truncated buffers, NaN/Infinity numbers, mixed-token
+  strings, multilingual diacritics, CJK, currency-symbol splitters,
+  invalid shortestPath weights, disconnected graphs).
+- Scale suite: 1 k / 10 k / 50 k synthetic graphs validate full
+  lifecycle (serialize → open → preload → text + numeric queries →
+  release) finishes within bounded time budgets.
+- New `minimal.fgg` (243 B, one vertex, no indices) and `maximal.fgg`
+  (2.3 kB, all indices + every column type) committed alongside
+  `cities-network.fgg`, `grid-with-paths.fgg`, `no-indices.fgg`.
+
+## 2.0.0
 
 Property indices on vertex features and edges — text, number, and
 boolean columns. **Format change:** the binary layout grows a 1-byte

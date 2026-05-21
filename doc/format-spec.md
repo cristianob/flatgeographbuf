@@ -1,34 +1,48 @@
 # FlatGeoGraphBuf Format Specification
 
-Version 2.0.0
+Version 2.1.0
 
 ## Overview
 
-FlatGeoGraphBuf is a binary format for geospatial graphs. It uses FlatGeobuf's encoding for features (vertices) and appends a graph section containing adjacency list information, optionally augmented with adjacency and spatial indices for random access.
+FlatGeoGraphBuf is a binary format for geospatial graphs. It uses FlatGeobuf's encoding for features (vertices) and appends a graph section containing adjacency list information, optionally augmented with structural indices (vertex R-tree, adjacency CSR, edge R-tree) and per-column property indices (text / number / boolean) for random-access queries.
 
 ## File Layout
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                    FGG HEADER                                        │
-├──────────────────────────────────────────────────────────────────────┤
-│ Magic Bytes (8B)             │ 0x6667670266676700 ("fgg\x02fgg\x00") │
-│ Header Size (4B)             │ uint32 little-endian                  │
-│ Header (FlatBuffer)          │ FlatGeobuf-style header               │
-│ Vertex R-Tree (optional)     │ Packed Hilbert R-Tree over features   │
-│ Features (variable)          │ Size-prefixed feature FlatBuffers     │
-├──────────────────────────────────────────────────────────────────────┤
-│                    GRAPH SECTION (optional)                          │
-├──────────────────────────────────────────────────────────────────────┤
-│ Graph Header Size (4B)       │ uint32 little-endian                  │
-│ Graph Header                 │ Edge count + columns + indexFlags     │
-│ Adjacency Block (optional)   │ CSR offsets, presence via indexFlags  │
-│ Edge R-Tree Block (optional) │ Packed Hilbert R-Tree over edges      │
-│ Edges (variable)             │ Size-prefixed edge records            │
-└──────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                    FGG HEADER                                          │
+├────────────────────────────────────────────────────────────────────────┤
+│ Magic Bytes (8B)             │ 0x6667670266676700 ("fgg\x02fgg\x00")   │
+│ Header Size (4B)             │ uint32 little-endian                    │
+│ Header (FlatBuffer)          │ FlatGeobuf-style header                 │
+├────────────────────────────────────────────────────────────────────────┤
+│                    VERTEX EXTRAS TRAILER (always present)              │
+├────────────────────────────────────────────────────────────────────────┤
+│ indexFlags (1B)              │ See bit table under Vertex Extras       │
+│ Vertex R-Tree (optional)     │ Bit 0x01; size from calcTreeSize        │
+│ Vertex Property Index (opt)  │ Bit 0x02; length-prefixed               │
+│ Future optional blocks       │ Length-prefixed (forward-compat)        │
+│ Padding (0-7B of 0x00)       │ Pads trailer to multiple of 8 bytes     │
+├────────────────────────────────────────────────────────────────────────┤
+│ Features (variable)          │ Size-prefixed feature FlatBuffers       │
+├────────────────────────────────────────────────────────────────────────┤
+│                    GRAPH SECTION (always present)                      │
+├────────────────────────────────────────────────────────────────────────┤
+│ Graph Header Size (4B)       │ uint32 little-endian                    │
+│ Graph Header                 │ Edge count + columns + indexFlags       │
+│ Adjacency Block (optional)   │ Bit 0x01; CSR offsets                   │
+│ Edge R-Tree Block (optional) │ Bit 0x02; packed Hilbert R-Tree         │
+│ Edge Property Index (opt)    │ Bit 0x04; per-column text/number/bool   │
+│ Future optional blocks       │ Length-prefixed (forward-compat)        │
+│ Edges (variable)             │ Size-prefixed edge records              │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-The vertex R-tree is signalled by `header.indexNodeSize > 0` (FlatGeobuf convention). The graph adjacency and edge R-tree blocks are signalled by bits in the new `indexFlags` byte of the Graph Header (see below).
+Both `indexFlags` bytes follow the same convention: a single byte where each set bit signals that the corresponding block follows immediately, in bit order from LSB to MSB. Blocks added by newer writer versions must be length-prefixed; readers walk past unknown bits via the leading 4-byte size of each block.
+
+Both `indexFlags` bytes are forward-compatible: readers must skip blocks corresponding to set-but-unrecognised bits by consuming their leading 4-byte size prefix. New writer versions can add bits without breaking older readers, provided the older reader uses this forward-compat skip rule.
+
+A graph section is always present even when the file carries no edges (it then contains just a graph header reporting `edgeCount = 0` and no optional blocks).
 
 ## Magic Bytes
 
@@ -41,6 +55,33 @@ The vertex R-tree is signalled by `header.indexNodeSize > 0` (FlatGeobuf convent
 
 This identifies the file as FlatGeoGraphBuf format. The graph section follows directly after the features section without additional magic bytes.
 
+## Vertex Extras Trailer
+
+A 1-byte `indexFlags` field plus zero or more optional blocks, padded with zeros to a multiple of 8 bytes. Always present, even when the file carries no optional vertex blocks.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ indexFlags (1B)              │ Optional-block bit field          │
+│ Bit 0x01 block: R-tree       │ Raw bytes, size = calcTreeSize    │
+│ Bit 0x02 block: Property idx │ [size:4B][content: size B]        │
+│ Future bits: blocks          │ [size:4B][content: size B]        │
+│ Padding (0-7B of 0x00)       │ Rounds total trailer to 8B mult.  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The trailing zero-padding keeps the features payload that follows aligned to 8 bytes, so FlatBuffer Float64 vectors (geometry coordinates) can be read without copying.
+
+### Vertex Index Flags
+
+| Bit | Mask   | Meaning                                                |
+|-----|--------|--------------------------------------------------------|
+| 0   | `0x01` | Vertex R-tree is present                               |
+| 1   | `0x02` | Vertex property index block is present                 |
+
+Setting a bit obliges the writer to emit the corresponding block immediately after the `indexFlags` byte, in bit order from LSB to MSB. The R-tree (bit `0x01`) is **not** length-prefixed — its size is computed from `header.featuresCount × header.indexNodeSize` using `calcTreeSize`. Every other block (current and future) MUST be length-prefixed so unrecognised bits can be skipped via the leading 4-byte size for forward compatibility.
+
+`header.indexNodeSize` defines the R-tree's branching factor (default 16) when bit `0x01` is set; the field is ignored when the bit is clear.
+
 ## Graph Header
 
 ```
@@ -48,20 +89,19 @@ This identifies the file as FlatGeoGraphBuf format. The graph section follows di
 │ Edge Count (4B)         │ uint32 little-endian                  │
 │ Column Count (2B)       │ uint16 little-endian                  │
 │ Columns (variable)      │ Repeated column definitions           │
-│ Index Flags (1B)        │ Bit 0: adjacency, Bit 1: edge R-tree  │
+│ Index Flags (1B)        │ See bit table below                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Index Flags
-
-A single byte bit field at the end of the graph header signals which optional graph indices follow it:
+### Graph Index Flags
 
 | Bit | Mask   | Meaning                                                |
 |-----|--------|--------------------------------------------------------|
 | 0   | `0x01` | Adjacency (CSR) block is present                       |
 | 1   | `0x02` | Edge R-tree block is present                           |
+| 2   | `0x04` | Edge property index block is present                   |
 
-Setting either bit obliges the writer to emit the corresponding block immediately after the header. When the adjacency bit is set, edge records MUST be physically sorted by `from` so the CSR offsets describe contiguous spans of edges.
+Setting a bit obliges the writer to emit the corresponding block immediately after the header (in bit order). When the adjacency bit is set, edge records MUST be physically sorted by `from` so the CSR offsets describe contiguous spans of edges. Unknown bits are skipped by readers via the leading size prefix of each optional block (forward-compat).
 
 ## Adjacency (CSR) Block
 
@@ -98,6 +138,79 @@ Per-edge bounding boxes are computed as the union of:
 - the bounding boxes of the `from` and `to` vertex geometries.
 
 Including the endpoint vertex bboxes guarantees that queries near a vertex catch every edge incident to it even when the LineString does not exactly start/end on the vertex point.
+
+## Property Index Block
+
+Used identically for vertices (in the vertex extras trailer, bit `0x01`) and for edges (in the graph section, bit `0x04`). Records are addressed by their physical storage index (0-based), matching the order in which features / edges appear in the file. Three column kinds coexist in a single block, in the fixed order below.
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│ Block Size (4B)              │ uint32 LE — bytes that follow      │
+│ Text Column Count (4B)       │ uint32 LE                          │
+│ For each text column:                                              │
+│   Name Length (4B)           │ uint32 LE                          │
+│   Name (variable)            │ UTF-8 bytes                        │
+│   Token Pool Size (4B)       │ uint32 LE                          │
+│   Token Pool (variable)      │ \0-separated unique normalized tok │
+│   Total Tokens Size (4B)     │ uint32 LE — = 2 × recordCount      │
+│   Total Tokens (variable)    │ uint16 LE × recordCount            │
+│   Entries Size (4B)          │ uint32 LE — = 10 × entryCount      │
+│   Entries (variable)         │ 10-byte tuples, see below          │
+│                                                                    │
+│ Numeric Column Count (4B)    │ uint32 LE                          │
+│ For each numeric column:                                           │
+│   Name Length / Name         │ as above                           │
+│   Entries Size (4B)          │ uint32 LE — = 12 × entryCount      │
+│   Entries (variable)         │ 12-byte tuples, see below          │
+│                                                                    │
+│ Bool Column Count (4B)       │ uint32 LE                          │
+│ For each bool column:                                              │
+│   Name Length / Name         │ as above                           │
+│   True List Size (4B)        │ uint32 LE — = 4 × trueCount        │
+│   True List (variable)       │ uint32 LE × trueCount (sorted asc) │
+│   False List Size (4B)       │ uint32 LE — = 4 × falseCount       │
+│   False List (variable)      │ uint32 LE × falseCount (sorted asc)│
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### Text Column Encoding
+
+- **Token Pool**: deduplicated, NUL-separated UTF-8 tokens. Each token is the result of applying the normalisation pipeline (see below) to a word from an indexed string.
+- **Total Tokens**: one `uint16` per record (in storage order). Records with a missing value have `totalTokens[i] = 0`. Limits each indexed value to 65 535 tokens.
+- **Entries** (10 bytes each, sorted ascending by the referenced token's bytes):
+
+  | Offset | Size | Field            | Meaning                                |
+  |--------|------|------------------|----------------------------------------|
+  | 0      | 4B   | tokenOffset      | uint32 LE — byte offset into Token Pool|
+  | 4      | 4B   | recordIdx        | uint32 LE — record (vertex/edge) index |
+  | 8      | 2B   | positionInString | uint16 LE — 0-based token position     |
+
+### Numeric Column Encoding
+
+Each entry is 12 bytes, sorted ascending by `value`:
+
+| Offset | Size | Field     | Meaning                                    |
+|--------|------|-----------|--------------------------------------------|
+| 0      | 8B   | value     | f64 little-endian (IEEE-754)               |
+| 8      | 4B   | recordIdx | uint32 LE — record (vertex/edge) index     |
+
+Records with non-finite or missing values are not indexed.
+
+### Boolean Column Encoding
+
+Two posting lists per column, each a sorted-ascending sequence of `uint32 LE` record indices. Records with missing values appear in neither list.
+
+### Text Normalisation (v1)
+
+Applied identically at write time and to query strings at read time:
+
+1. Unicode NFKD decomposition.
+2. Strip every combining mark (Unicode category `Mn`).
+3. Lowercase via `String.prototype.toLowerCase()` (ASCII fold + Unicode lowercase for non-Latin scripts).
+
+### Text Tokenisation (v1)
+
+After normalisation, split on every run of Unicode whitespace (`\s`), punctuation (`\p{P}`), or symbols (`\p{S}`). Empty tokens are discarded. The dollar sign `$`, plus `+`, and similar currency / math symbols separate tokens (they fall in `\p{S}`).
 
 ### Column Definition
 

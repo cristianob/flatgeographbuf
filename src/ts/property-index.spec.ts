@@ -65,7 +65,7 @@ describe('text property index — round-trip & basic queries', () => {
         const fgg = await FlatGeoGraphBuf.open(bytes);
         const hits = await collect(fgg.findVerticesByText('name', 'brasilia'));
         expect(hits).toHaveLength(1);
-        expect((hits[0].properties as { name: string }).name).toBe('Brasília');
+        expect((hits[0].feature.properties as { name: string }).name).toBe('Brasília');
     });
 
     it('matches "rio preto" against "São José do Rio Preto" and "Rio Preto"', async () => {
@@ -73,7 +73,7 @@ describe('text property index — round-trip & basic queries', () => {
         const bytes = serialize(geojson, adjacency, { columnIndex: { vertices: ['name'] } });
         const fgg = await FlatGeoGraphBuf.open(bytes);
         const hits = await collect(fgg.findVerticesByText('name', 'rio preto'));
-        const names = hits.map((h) => (h.properties as { name: string }).name);
+        const names = hits.map((h) => (h.feature.properties as { name: string }).name);
         // Both "Rio Preto" and "São José do Rio Preto" match. The shorter
         // / earlier match should rank first.
         expect(names).toContain('Rio Preto');
@@ -88,8 +88,8 @@ describe('text property index — round-trip & basic queries', () => {
         const ordered = await collect(fgg.findVerticesByText('name', 'rio preto'));
         const reversed = await collect(fgg.findVerticesByText('name', 'preto rio'));
         expect(reversed.length).toBe(ordered.length);
-        expect(new Set(reversed.map((f) => (f.properties as { name: string }).name))).toEqual(
-            new Set(ordered.map((f) => (f.properties as { name: string }).name)),
+        expect(new Set(reversed.map((h) => (h.feature.properties as { name: string }).name))).toEqual(
+            new Set(ordered.map((h) => (h.feature.properties as { name: string }).name)),
         );
     });
 
@@ -98,7 +98,7 @@ describe('text property index — round-trip & basic queries', () => {
         const bytes = serialize(geojson, adjacency, { columnIndex: { vertices: ['name'] } });
         const fgg = await FlatGeoGraphBuf.open(bytes);
         const hits = await collect(fgg.findVerticesByText('name', 'rio pre'));
-        const names = hits.map((h) => (h.properties as { name: string }).name);
+        const names = hits.map((h) => (h.feature.properties as { name: string }).name);
         expect(names).toContain('Rio Preto');
         expect(names).toContain('São José do Rio Preto');
     });
@@ -135,10 +135,10 @@ describe('text query — match modes', () => {
         const fgg = await FlatGeoGraphBuf.open(bytes);
         // "Rio Preto" tokenises to exactly ['rio','preto'] → exact match.
         const exact = await collect(fgg.findVerticesByText('name', 'rio preto', { match: 'exact' }));
-        expect(exact.map((f) => (f.properties as { name: string }).name)).toEqual(['Rio Preto']);
+        expect(exact.map((h) => (h.feature.properties as { name: string }).name)).toEqual(['Rio Preto']);
         // "São José do Rio Preto" has more tokens → doesn't match exact.
         const exact2 = await collect(fgg.findVerticesByText('name', 'sao jose do rio preto', { match: 'exact' }));
-        expect(exact2.map((f) => (f.properties as { name: string }).name)).toEqual(['São José do Rio Preto']);
+        expect(exact2.map((h) => (h.feature.properties as { name: string }).name)).toEqual(['São José do Rio Preto']);
     });
 });
 
@@ -165,7 +165,7 @@ describe('text query — ranking tiers', () => {
         const bytes = serialize(geojsonForRanking(), { edges: [] }, { columnIndex: { vertices: ['name'] } });
         const fgg = await FlatGeoGraphBuf.open(bytes);
         const hits = await collect(fgg.findVerticesByText('name', 'rio preto'));
-        const names = hits.map((h) => (h.properties as { name: string }).name);
+        const names = hits.map((h) => (h.feature.properties as { name: string }).name);
         // tier A entries first (Rio Preto, São José do Rio Preto)
         expect(names.slice(0, 2)).toEqual(['Rio Preto', 'São José do Rio Preto']);
         // tier B (Rio Grande do Sul Preto) — in order with gap
@@ -180,9 +180,66 @@ describe('text query — ranking tiers', () => {
         const bytes = serialize(geojsonForRanking(), { edges: [] }, { columnIndex: { vertices: ['name'] } });
         const fgg = await FlatGeoGraphBuf.open(bytes);
         const hits = await collect(fgg.findVerticesByText('name', 'rio preto'));
-        const names = hits.map((h) => (h.properties as { name: string }).name);
+        const names = hits.map((h) => (h.feature.properties as { name: string }).name);
         // Rio Preto starts at position 0; São José do Rio Preto at position 3.
         expect(names.indexOf('Rio Preto')).toBeLessThan(names.indexOf('São José do Rio Preto'));
+    });
+
+    it('returns the tier label on each hit (A | B | C)', async () => {
+        const bytes = serialize(geojsonForRanking(), { edges: [] }, { columnIndex: { vertices: ['name'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const hits = await collect(fgg.findVerticesByText('name', 'rio preto'));
+        const byName = new Map(
+            hits.map((h) => [(h.feature.properties as { name: string }).name, h.tier]),
+        );
+        expect(byName.get('Rio Preto')).toBe('A');
+        expect(byName.get('São José do Rio Preto')).toBe('A');
+        expect(byName.get('Rio Grande do Sul Preto')).toBe('B');
+        expect(byName.get('Preto e Rio')).toBe('C');
+    });
+
+    it('single-token query trivially yields tier A for every hit', async () => {
+        const bytes = serialize(geojsonForRanking(), { edges: [] }, { columnIndex: { vertices: ['name'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const hits = await collect(fgg.findVerticesByText('name', 'rio'));
+        expect(hits.length).toBeGreaterThan(0);
+        for (const h of hits) expect(h.tier).toBe('A');
+    });
+
+    it('tier reflects exact match mode (always A for the single qualifier)', async () => {
+        const bytes = serialize(geojsonForRanking(), { edges: [] }, { columnIndex: { vertices: ['name'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const hits = await collect(
+            fgg.findVerticesByText('name', 'rio preto', { match: 'exact' }),
+        );
+        expect(hits).toHaveLength(1);
+        expect(hits[0].tier).toBe('A');
+        expect((hits[0].feature.properties as { name: string }).name).toBe('Rio Preto');
+    });
+
+    it('edge text queries expose tier labels as well', async () => {
+        const geojson: GeoJsonFeatureCollection = {
+            type: 'FeatureCollection',
+            features: [
+                { type: 'Feature', geometry: { type: 'Point', coordinates: [0, 0] }, properties: {} },
+                { type: 'Feature', geometry: { type: 'Point', coordinates: [1, 0] }, properties: {} },
+                { type: 'Feature', geometry: { type: 'Point', coordinates: [2, 0] }, properties: {} },
+            ],
+        };
+        const adjacency: AdjacencyListInput = {
+            edges: [
+                { from: 0, to: 1, properties: { road: 'BR 116 Norte' } },     // tier A
+                { from: 0, to: 2, properties: { road: 'BR Sul 116' } },       // tier B
+                { from: 1, to: 2, properties: { road: '116 da BR' } },        // tier C
+            ],
+        };
+        const bytes = serialize(geojson, adjacency, { columnIndex: { edges: ['road'] } });
+        const fgg = await FlatGeoGraphBuf.open(bytes);
+        const hits = await collect(fgg.findEdgesByText('road', 'br 116'));
+        const byRoad = new Map(hits.map((h) => [(h.edge.properties as { road: string }).road, h.tier]));
+        expect(byRoad.get('BR 116 Norte')).toBe('A');
+        expect(byRoad.get('BR Sul 116')).toBe('B');
+        expect(byRoad.get('116 da BR')).toBe('C');
     });
 });
 
@@ -193,7 +250,7 @@ describe('text query — limit option', () => {
         const fgg = await FlatGeoGraphBuf.open(bytes);
         const limited = await collect(fgg.findVerticesByText('name', 'rio preto', { limit: 1 }));
         expect(limited).toHaveLength(1);
-        expect((limited[0].properties as { name: string }).name).toBe('Rio Preto');
+        expect((limited[0].feature.properties as { name: string }).name).toBe('Rio Preto');
     });
 });
 
@@ -251,8 +308,10 @@ describe('edge property indices', () => {
         const bytes = serialize(geojson, adjacency, { columnIndex: { edges: ['road'] } });
         const fgg = await FlatGeoGraphBuf.open(bytes);
         const hits = await collect(fgg.findEdgesByText('road', 'br-1'));
-        const roads = hits.map((e) => (e.properties as { road: string }).road).sort();
+        const roads = hits.map((h) => (h.edge.properties as { road: string }).road).sort();
         expect(roads).toEqual(['BR-101', 'BR-116', 'BR-153']);
+        // Every hit should expose a tier label.
+        for (const h of hits) expect(['A', 'B', 'C']).toContain(h.tier);
     });
 
     it('range query on edges', async () => {

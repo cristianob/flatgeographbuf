@@ -258,38 +258,32 @@ export function serialize(
         });
     }
 
-    let graphSection: Uint8Array | null = null;
-    if (remappedAdjacency !== undefined || edgePropertyIndex !== null) {
-        graphSection = buildGraphSection(remappedAdjacency ?? { edges: [] }, featureCount, {
-            writeAdjacencyIndex: effectiveAdjacencyIndex,
-            writeEdgeIndex: effectiveEdgeIndex,
-            vertexBboxes: effectiveEdgeIndex ? orderedBboxes : undefined,
-            edgePropertyIndex,
-        });
-    }
+    // Always emit a graph section, even when the file has no edges —
+    // the reader treats its absence as a malformed file. An empty
+    // graph section is just the size-prefixed graph header reporting
+    // edgeCount = 0 and no optional blocks.
+    const graphSection: Uint8Array = buildGraphSection(remappedAdjacency ?? { edges: [] }, featureCount, {
+        writeAdjacencyIndex: effectiveAdjacencyIndex,
+        writeEdgeIndex: effectiveEdgeIndex,
+        vertexBboxes: effectiveEdgeIndex ? orderedBboxes : undefined,
+        edgePropertyIndex,
+    });
 
-    // Vertex extras trailer (1B indexFlags + optional length-prefixed
-    // blocks) lives between the vertex R-tree and the features payload.
-    // Mirrors the graph-section flag-based layout for symmetry.
-    const vertexExtras = buildVertexExtras(vertexPropertyIndex);
+    // Vertex extras trailer: 1B indexFlags + optional vertex R-tree
+    // (bit 0x01) + optional property index (bit 0x02), padded to a
+    // multiple of 8 so the features section that follows keeps its
+    // natural Float64 alignment. Mirrors the graph-section flag-based
+    // layout for symmetry.
+    const vertexExtras = buildVertexExtras(indexBytes, vertexPropertyIndex);
 
     const totalLength =
-        magicbytes.length +
-        header.length +
-        (indexBytes?.length ?? 0) +
-        vertexExtras.length +
-        featuresLength +
-        (graphSection?.length ?? 0);
+        magicbytes.length + header.length + vertexExtras.length + featuresLength + graphSection.length;
     const uint8 = new Uint8Array(totalLength);
 
     uint8.set(magicbytes);
     uint8.set(header, magicbytes.length);
 
     let offset = magicbytes.length + header.length;
-    if (indexBytes) {
-        uint8.set(indexBytes, offset);
-        offset += indexBytes.length;
-    }
     uint8.set(vertexExtras, offset);
     offset += vertexExtras.length;
     for (const feature of featureBuffers) {
@@ -297,9 +291,7 @@ export function serialize(
         offset += feature.length;
     }
 
-    if (graphSection) {
-        uint8.set(graphSection, offset);
-    }
+    uint8.set(graphSection, offset);
 
     return uint8;
 }

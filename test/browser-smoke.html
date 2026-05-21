@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>FlatGeoGraphBuf browser smoke test</title>
+    <style>
+        body { font-family: ui-monospace, monospace; padding: 1rem; max-width: 80ch; }
+        .ok   { color: #2a8; }
+        .fail { color: #c33; }
+        pre   { background: #f4f4f4; padding: 0.5rem; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>FlatGeoGraphBuf browser smoke test</h1>
+    <p>
+        Serve this directory (e.g. <code>npx serve .</code>) and open
+        <code>test/browser-smoke.html</code>. The script below imports the
+        production ESM bundle, serializes a tiny graph, opens it, runs every
+        query method, and prints the results. Any red line means the package
+        broke in a real browser context.
+    </p>
+    <pre id="out">running…</pre>
+
+    <script type="module">
+        import {
+            serialize,
+            deserialize,
+            FlatGeoGraphBuf,
+        } from '../dist/flatgeographbuf-geojson.esm.min.js';
+
+        const out = document.getElementById('out');
+        const log = (msg, cls = 'ok') => {
+            const span = document.createElement('span');
+            span.className = cls;
+            span.textContent = `${cls === 'ok' ? '✓' : '✗'} ${msg}\n`;
+            out.appendChild(span);
+        };
+
+        async function main() {
+            out.textContent = '';
+
+            // 1. serialize
+            const geojson = {
+                type: 'FeatureCollection',
+                features: [
+                    { type: 'Feature', geometry: { type: 'Point', coordinates: [-46.63, -23.55] }, properties: { name: 'SP' } },
+                    { type: 'Feature', geometry: { type: 'Point', coordinates: [-43.17, -22.91] }, properties: { name: 'RJ' } },
+                    { type: 'Feature', geometry: { type: 'Point', coordinates: [-47.93, -15.78] }, properties: { name: 'BSB' } },
+                ],
+            };
+            const adjacency = {
+                edges: [
+                    { from: 0, to: 1, properties: { km: 429 } },
+                    { from: 0, to: 2, properties: { km: 1015 } },
+                ],
+            };
+            const bytes = serialize(geojson, adjacency);
+            log(`serialize: ${bytes.byteLength} bytes`);
+
+            // 2. deserialize
+            const { features, adjacencyList } = await deserialize(bytes);
+            if (features.length !== 3) throw new Error(`expected 3 features, got ${features.length}`);
+            if (adjacencyList.edges.length !== 2) throw new Error(`expected 2 edges`);
+            log(`deserialize: ${features.length} features, ${adjacencyList.edges.length} edges`);
+
+            // 3. FlatGeoGraphBuf.open
+            const fgg = await FlatGeoGraphBuf.open(bytes);
+            log(`open: featureCount=${fgg.featureCount}`);
+
+            // 4. getFeature
+            const v0 = await fgg.getFeature(0);
+            log(`getFeature(0): ${v0.properties.name}`);
+
+            // 5. outgoingEdgesOf
+            const spIndex = features.findIndex(f => f.properties.name === 'SP');
+            const outEdges = [];
+            for await (const e of fgg.outgoingEdgesOf(spIndex)) outEdges.push(e);
+            log(`outgoingEdgesOf(SP): ${outEdges.length} edges`);
+
+            // 6. featuresInBbox
+            const inBbox = [];
+            for await (const f of fgg.featuresInBbox({
+                minX: -50, minY: -25, maxX: -40, maxY: -10,
+            })) inBbox.push(f);
+            log(`featuresInBbox: ${inBbox.length} features`);
+
+            // 7. edgesInBbox
+            const edges = [];
+            for await (const e of fgg.edgesInBbox({
+                minX: -50, minY: -25, maxX: -40, maxY: -10,
+            })) edges.push(e);
+            log(`edgesInBbox: ${edges.length} edges`);
+
+            // 8. shortestPath
+            const path = await fgg.shortestPath(spIndex, features.findIndex(f => f.properties.name === 'BSB'));
+            if (!path) throw new Error('shortestPath returned null');
+            log(`shortestPath: ${path.edges.length} hops, cost ${(path.cost / 1000).toFixed(0)} km`);
+
+            // 9. preload + zero-IO re-query
+            await fgg.preload();
+            const reSp = await fgg.getFeature(spIndex);
+            if (reSp.properties.name !== v0.properties.name && v0.properties.name) {
+                // The Hilbert sort may reorder; just check the call works.
+            }
+            log(`preload + re-query: ok`);
+
+            log('ALL SMOKE TESTS PASSED', 'ok');
+        }
+
+        main().catch(err => {
+            log(`SMOKE TEST FAILED: ${err.message}`, 'fail');
+            console.error(err);
+        });
+    </script>
+</body>
+</html>

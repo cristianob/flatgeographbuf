@@ -21,6 +21,10 @@ export interface Rect {
 }
 
 export function calcTreeSize(numItems: number, nodeSize: number): number {
+    // Guard against numItems = 0: the do/while below would spin forever
+    // because Math.ceil(0 / nodeSize) is 0, never reaching 1. A zero-item
+    // index has no tree, so its size is 0 bytes.
+    if (numItems <= 0) return 0;
     nodeSize = Math.min(Math.max(+nodeSize, 2), 65535);
     let n = numItems;
     let numNodes = n;

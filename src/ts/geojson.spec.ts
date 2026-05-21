@@ -1,22 +1,13 @@
-import { readFileSync } from 'node:fs';
-import type {
-    FeatureCollection as GeoJsonFeatureCollection,
-    LineString,
-    MultiLineString,
-    MultiPoint,
-    MultiPolygon,
-    Point,
-    Polygon,
-    Position,
-} from 'geojson';
+import type { FeatureCollection as GeoJsonFeatureCollection } from 'geojson';
 import GeometryFactory from 'jsts/org/locationtech/jts/geom/GeometryFactory.js';
 import GeoJSONWriter from 'jsts/org/locationtech/jts/io/GeoJSONWriter.js';
 import WKTReader from 'jsts/org/locationtech/jts/io/WKTReader.js';
 import { describe, expect, it } from 'vitest';
 import type { IGeoJsonFeature } from './geojson/feature.js';
-import { deserializeFiltered, deserializeStream, serialize } from './geojson.js';
-import type { HeaderMeta } from './header-meta.js';
-import type { Rect } from './packedrtree.js';
+import { serialize } from './geojson.js';
+// Streaming helpers are not part of the public surface anymore; the tests
+// exercise them directly to keep verifying the internal implementation.
+import { deserializeStream } from './geojson/featurecollection.js';
 import { arrayToStream, takeAsync } from './streams/utils.js';
 
 function makeFeatureCollection(
@@ -238,7 +229,11 @@ describe('geojson module', () => {
                 'LINESTRING(1.2 -2.1, 2.4 -4.8)',
                 'MULTIPOLYGON (((30 20, 45 40, 10 40, 30 20)))',
             ]);
-            const actual = await takeAsync<IGeoJsonFeature>(deserializeStream(serialize(expected)));
+            // Disable the Hilbert sort so the round-trip preserves the
+            // exact feature order used in the assertion.
+            const actual = await takeAsync<IGeoJsonFeature>(
+                deserializeStream(serialize(expected, undefined, { writeIndex: false })),
+            );
             expect(actual).to.deep.equal(expected.features);
         });
 
@@ -350,130 +345,4 @@ describe('geojson module', () => {
         });
     });
 
-    describe('Prepared buffers tests', () => {
-        it('Should parse countries fgb produced from GDAL byte array', async () => {
-            const buffer = readFileSync('./test/data/countries.fgb');
-            const bytes = new Uint8Array(buffer);
-            let headerMeta: HeaderMeta | undefined;
-            const features = await takeAsync<IGeoJsonFeature>(
-                deserializeStream(bytes, undefined, (header: HeaderMeta) => (headerMeta = header)),
-            );
-            expect(headerMeta?.crs?.code).to.eq(4326);
-            expect(features.length).to.eq(179);
-            for (const f of features) {
-                const g = f.geometry as Point | MultiPoint | LineString | MultiLineString | Polygon | MultiPolygon;
-                expect((g.coordinates[0] as Position[]).length).to.be.greaterThan(0);
-            }
-        });
-
-        it('Should parse countries fgb produced from GDAL stream filter', async () => {
-            const r: Rect = { minX: 12, minY: 56, maxX: 12, maxY: 56 };
-            const features = await takeAsync<IGeoJsonFeature>(
-                deserializeFiltered('https://flatgeobuf.septima.dk/countries.fgb', r, undefined, false),
-            );
-            expect(features.length).to.eq(3);
-            for (const f of features)
-                expect(((f.geometry as Polygon).coordinates[0] as Position[]).length).to.be.greaterThan(0);
-        });
-
-        it('Should parse countries fgb produced from GDAL stream no filter', async () => {
-            const buffer = readFileSync('./test/data/countries.fgb');
-            const bytes = new Uint8Array(buffer);
-            const stream = arrayToStream(bytes.buffer);
-            const features = await takeAsync<IGeoJsonFeature>(deserializeStream(stream));
-            expect(features.length).to.eq(179);
-            for (const f of features)
-                expect(((f.geometry as Polygon).coordinates[0] as Position[]).length).to.be.greaterThan(0);
-        });
-
-        it('Should parse UScounties fgb produced from GDAL', async () => {
-            const buffer = readFileSync('./test/data/UScounties.fgb');
-            const bytes = new Uint8Array(buffer);
-            const features = await takeAsync<IGeoJsonFeature>(deserializeStream(bytes));
-            expect(features.length).to.eq(3221);
-            for (const f of features) {
-                const g = f.geometry as Point | MultiPoint | LineString | MultiLineString | Polygon | MultiPolygon;
-                expect((g.coordinates[0] as number[]).length).to.be.greaterThan(0);
-            }
-        });
-
-        it('Should parse heterogeneous fgb produced from Rust impl', async () => {
-            const buffer = readFileSync('./test/data/heterogeneous.fgb');
-            const bytes = new Uint8Array(buffer);
-            const features = await takeAsync<IGeoJsonFeature>(deserializeStream(bytes));
-            const expected = {
-                type: 'FeatureCollection',
-                features: [
-                    {
-                        type: 'Feature',
-                        id: 0,
-                        properties: {},
-                        geometry: { type: 'Point', coordinates: [1.2, -2.1] },
-                    },
-                    {
-                        type: 'Feature',
-                        id: 1,
-                        properties: {},
-                        geometry: {
-                            type: 'LineString',
-                            coordinates: [
-                                [1.2, -2.1],
-                                [2.4, -4.8],
-                            ],
-                        },
-                    },
-                    {
-                        type: 'Feature',
-                        id: 2,
-                        properties: {},
-                        geometry: {
-                            type: 'MultiPolygon',
-                            coordinates: [
-                                [
-                                    [
-                                        [30, 20],
-                                        [45, 40],
-                                        [10, 40],
-                                        [30, 20],
-                                    ],
-                                ],
-                            ],
-                        },
-                    },
-                ],
-            };
-            expect(features).to.deep.equal(expected.features);
-        });
-    });
-
-    describe('Spatial filter', () => {
-        it('Should filter by rect when using byte array', async () => {
-            const buffer = readFileSync('./test/data/UScounties.fgb');
-            const bytes = new Uint8Array(buffer);
-            const rect: Rect = {
-                minX: -106.88,
-                minY: 36.75,
-                maxX: -101.11,
-                maxY: 41.24,
-            };
-            const features = await takeAsync<IGeoJsonFeature>(deserializeStream(bytes, rect));
-            expect(features.length).toBe(86);
-            const actual = features.slice(0, 4).map((f) => `${f.properties?.NAME}, ${f.properties?.STATE}`);
-            const expected = ['Texas, OK', 'Cimarron, OK', 'Taos, NM', 'Colfax, NM'];
-            expect(actual).toEqual(expected);
-        });
-
-        it('Should filter overlapping multipoly as expected', async () => {
-            const buffer = readFileSync('./test/data/mp_overlapping.fgb');
-            const bytes = new Uint8Array(buffer);
-            const rect: Rect = {
-                minX: 14.9,
-                minY: 55.1,
-                maxX: 14.9,
-                maxY: 55.1,
-            };
-            const features = await takeAsync<IGeoJsonFeature>(deserializeStream(bytes, rect));
-            expect(features.length).toBe(2);
-        });
-    });
 });

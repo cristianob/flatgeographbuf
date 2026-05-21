@@ -10,7 +10,15 @@ export * as generic from './generic.js';
 
 export type { IGeoJsonFeature } from './geojson/feature.js';
 export * as geojson from './geojson.js';
+export { FlatGeoGraphBuf } from './graph-reader.js';
+export {
+    byteReaderFromUint8Array,
+    byteReaderFromUrl,
+    type ByteReader,
+    type UrlReaderOptions,
+} from './byte-reader.js';
 export type { AdjacencyList, DeserializeGraphResult, Edge, EdgeProperties, GraphHeaderMeta } from './graph-types.js';
 export type { HeaderMeta } from './header-meta.js';
 export * as ol from './ol.js';
 export type { Rect } from './packedrtree.js';
+export type { EdgeWeightFn, HeuristicFn, ShortestPathOptions, ShortestPathResult } from './shortest-path.js';

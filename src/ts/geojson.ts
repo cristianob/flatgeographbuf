@@ -1,16 +1,13 @@
 import type { FeatureCollection as GeoJsonFeatureCollection } from 'geojson';
-import type { HeaderMetaFn } from './generic.js';
 import type { IGeoJsonFeature } from './geojson/feature.js';
 import {
     deserialize as fcDeserialize,
-    deserializeFiltered as fcDeserializeFiltered,
-    deserializeGraphEdges as fcDeserializeGraphEdges,
-    deserializeStream as fcDeserializeStream,
     serialize as fcSerialize,
+    type SerializeOptions,
 } from './geojson/featurecollection.js';
-import type { AdjacencyListInput, DeserializeGraphResult, Edge, FlatGeoGraphBufMetaFn } from './graph-types.js';
-import type { Rect } from './packedrtree.js';
+import type { AdjacencyListInput, DeserializeGraphResult, FlatGeoGraphBufMetaFn } from './graph-types.js';
 
+export type { SerializeOptions } from './geojson/featurecollection.js';
 export type {
     AdjacencyList,
     AdjacencyListInput,
@@ -24,12 +21,17 @@ export type {
     GraphHeaderMeta,
 } from './graph-types.js';
 
+// Random-access reader and byte-source abstraction
+export { FlatGeoGraphBuf } from './graph-reader.js';
+export { byteReaderFromUint8Array, byteReaderFromUrl, type ByteReader, type UrlReaderOptions } from './byte-reader.js';
+export type { EdgeWeightFn, HeuristicFn, ShortestPathOptions, ShortestPathResult } from './shortest-path.js';
+
 export function serialize(
     geojson: GeoJsonFeatureCollection,
     adjacencyList?: AdjacencyListInput,
-    crsCode = 0,
+    options?: SerializeOptions,
 ): Uint8Array {
-    return fcSerialize(geojson, adjacencyList, crsCode);
+    return fcSerialize(geojson, adjacencyList, options);
 }
 
 export async function deserialize(
@@ -37,26 +39,4 @@ export async function deserialize(
     metaFn?: FlatGeoGraphBufMetaFn,
 ): Promise<DeserializeGraphResult<IGeoJsonFeature>> {
     return fcDeserialize(bytes, metaFn);
-}
-
-export function deserializeStream(
-    input: Uint8Array | ReadableStream,
-    rect?: Rect,
-    headerMetaFn?: HeaderMetaFn,
-): AsyncGenerator<IGeoJsonFeature> {
-    return fcDeserializeStream(input, rect, headerMetaFn) as AsyncGenerator<IGeoJsonFeature>;
-}
-
-export function deserializeFiltered(
-    url: string,
-    rect: Rect,
-    headerMetaFn?: HeaderMetaFn,
-    nocache = false,
-    headers: HeadersInit = {},
-): AsyncGenerator<IGeoJsonFeature> {
-    return fcDeserializeFiltered(url, rect, headerMetaFn, nocache, headers) as AsyncGenerator<IGeoJsonFeature>;
-}
-
-export function deserializeGraphEdges(bytes: Uint8Array): AsyncGenerator<Edge, void, unknown> {
-    return fcDeserializeGraphEdges(bytes);
 }

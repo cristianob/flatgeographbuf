@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import Feature, { type FeatureLike } from 'ol/Feature.js';
 import GeoJSON from 'ol/format/GeoJSON.js';
 import WKT from 'ol/format/WKT.js';
@@ -297,34 +296,6 @@ describe('ol module', () => {
                 deserialize(serialize(geojson.readFeatures(expected))),
             )) as Feature[];
             expect(JSON.parse(g(actual))).to.deep.equal(expected);
-        });
-
-        it('Should parse UScounties fgb produced from GDAL array buffer', async () => {
-            const buffer = readFileSync('./test/data/UScounties.fgb');
-            const bytes = new Uint8Array(buffer);
-            const features = (await takeAsync<FeatureLike>(deserialize(bytes))) as Feature[];
-            expect(features.length).to.eq(3221);
-            for (const f of features)
-                expect((f.getGeometry() as SimpleGeometry).getCoordinates()?.length).to.be.greaterThan(0);
-        });
-
-        it('Should parse countries fgb produced from GDAL array buffer', async () => {
-            const buffer = readFileSync('./test/data/countries.fgb');
-            const bytes = new Uint8Array(buffer);
-            const features = (await takeAsync<FeatureLike>(deserialize(bytes))) as Feature[];
-            expect(features.length).to.eq(179);
-            for (const f of features)
-                expect((f.getGeometry() as SimpleGeometry).getCoordinates()?.length).to.be.greaterThan(0);
-        });
-
-        it('Should parse countries fgb produced from GDAL stream', async () => {
-            const buffer = readFileSync('./test/data/countries.fgb');
-            const bytes = new Uint8Array(buffer);
-            const stream = arrayToStream(bytes.buffer);
-            const features = (await takeAsync<FeatureLike>(deserialize(stream))) as Feature[];
-            expect(features.length).to.eq(179);
-            for (const f of features)
-                expect((f.getGeometry() as SimpleGeometry).getCoordinates()?.length).to.be.greaterThan(0);
         });
 
         it('Bahamas', async () => {

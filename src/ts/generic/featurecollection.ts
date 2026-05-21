@@ -166,6 +166,11 @@ export function buildHeader(header: HeaderMeta, crsCode = 0): Uint8Array {
 
     const nameOffset = builder.createString('L1');
 
+    let envelopeOffset: flatbuffers.Offset | undefined;
+    if (header.envelope && header.envelope.length === 4) {
+        envelopeOffset = Header.createEnvelopeVector(builder, header.envelope);
+    }
+
     let crsOffset: flatbuffers.Offset | undefined;
     if (crsCode) {
         Crs.startCrs(builder);
@@ -176,7 +181,8 @@ export function buildHeader(header: HeaderMeta, crsCode = 0): Uint8Array {
     if (crsOffset) Header.addCrs(builder, crsOffset);
     Header.addFeaturesCount(builder, BigInt(header.featuresCount));
     Header.addGeometryType(builder, header.geometryType);
-    Header.addIndexNodeSize(builder, 0);
+    Header.addIndexNodeSize(builder, header.indexNodeSize);
+    if (envelopeOffset !== undefined) Header.addEnvelope(builder, envelopeOffset);
     if (columnOffsets) Header.addColumns(builder, columnOffsets);
     Header.addName(builder, nameOffset);
     const offset = Header.endHeader(builder);

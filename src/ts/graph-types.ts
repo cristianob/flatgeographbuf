@@ -1,3 +1,4 @@
+import type { LineString } from 'geojson';
 import type { ColumnMeta } from './column-meta.js';
 import type { CrsMeta } from './crs-meta.js';
 import type { GeometryType } from './flat-geobuf/geometry-type.js';
@@ -9,12 +10,14 @@ export interface EdgeProperties {
 export interface EdgeInput {
     from: number;
     to: number;
+    geometry?: LineString | null;
     properties?: EdgeProperties;
 }
 
 export interface Edge {
     from: number;
     to: number;
+    geometry: LineString | null;
     properties: EdgeProperties;
 }
 
@@ -41,6 +44,8 @@ export interface FeaturesHeaderMeta {
 export interface GraphHeaderMeta {
     edgeCount: number;
     edgeColumns: ColumnMeta[] | null;
+    hasAdjacencyIndex: boolean;
+    hasEdgeIndex: boolean;
 }
 
 export interface DeserializeGraphResult<T> {

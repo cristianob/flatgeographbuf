@@ -28,22 +28,36 @@ const plugins = [
 export default [
     {
         input: './lib/mjs/generic.js',
-        output: {
-            file: 'dist/flatgeographbuf.min.js',
-            format: 'umd',
-            name: 'flatgeographbuf',
-            sourcemap: false,
-        },
+        output: [
+            {
+                file: 'dist/flatgeographbuf.min.js',
+                format: 'umd',
+                name: 'flatgeographbuf',
+                sourcemap: false,
+            },
+            {
+                file: 'dist/flatgeographbuf.esm.min.js',
+                format: 'esm',
+                sourcemap: false,
+            },
+        ],
         plugins,
     },
     {
         input: './lib/mjs/geojson.js',
-        output: {
-            file: 'dist/flatgeographbuf-geojson.min.js',
-            format: 'umd',
-            name: 'flatgeographbuf',
-            sourcemap: false,
-        },
+        output: [
+            {
+                file: 'dist/flatgeographbuf-geojson.min.js',
+                format: 'umd',
+                name: 'flatgeographbuf',
+                sourcemap: false,
+            },
+            {
+                file: 'dist/flatgeographbuf-geojson.esm.min.js',
+                format: 'esm',
+                sourcemap: false,
+            },
+        ],
         plugins,
     },
     {

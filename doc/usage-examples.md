@@ -5,7 +5,10 @@
 - [Installation](#installation)
 - [Basic Usage](#basic-usage)
 - [Working with Edges](#working-with-edges)
+- [Edge Geometry (LineString paths)](#edge-geometry-linestring-paths)
 - [Edge Properties](#edge-properties)
+- [Indices and Random-Access Queries](#indices-and-random-access-queries)
+- [Shortest Path (Dijkstra / A*)](#shortest-path-dijkstra--a)
 - [Metadata Callback](#metadata-callback)
 - [Streaming Large Graphs](#streaming-large-graphs)
 - [Integration with Graph Libraries](#integration-with-graph-libraries)
@@ -201,6 +204,264 @@ result.adjacencyList.edges.forEach(edge => {
 });
 ```
 
+## Edge Geometry (LineString paths)
+
+Edges may carry an optional `LineString` describing the actual path of
+the connection — useful for curved roads, transmission lines following
+terrain, etc. When omitted (or `null`), the edge represents an implicit
+straight line between its `from` and `to` vertices.
+
+```typescript
+const adjacencyList = {
+    edges: [
+        // Straight-line edge — no geometry stored
+        { from: 0, to: 1, properties: { name: 'fast lane' } },
+
+        // Curved edge — explicit path
+        {
+            from: 1,
+            to: 2,
+            geometry: {
+                type: 'LineString',
+                coordinates: [
+                    [-46.5, -23.5],
+                    [-46.45, -23.48],
+                    [-46.42, -23.46],
+                    [-46.4, -23.45],
+                ],
+            },
+            properties: { name: 'serra do mar' },
+        },
+    ],
+};
+```
+
+Constraints:
+
+- Only `LineString` is accepted on edges.
+- When present, the LineString must have at least 2 coordinates.
+- Only 2D (`[x, y]`) coordinates are supported.
+- By convention the first / last coordinates match the endpoint vertices,
+  but the format does not enforce that.
+
+## Indices and Random-Access Queries
+
+`serialize` can write up to three independent indices, all enabled by
+default. Each can be toggled via `SerializeOptions`:
+
+```typescript
+const bytes = serialize(geojson, edges, {
+    writeIndex: true,            // vertex R-tree (default true)
+    writeAdjacencyIndex: true,   // CSR for outgoing edges (default true)
+    writeEdgeIndex: true,        // edge R-tree (default true)
+});
+
+// To produce a minimal "no-indices" file:
+const bare = serialize(geojson, edges, {
+    writeIndex: false,
+    writeAdjacencyIndex: false,
+    writeEdgeIndex: false,
+});
+```
+
+Enabling `writeIndex` reorders vertices along the Hilbert curve and
+auto-remaps edge `from` / `to` so references stay consistent. Enabling
+`writeAdjacencyIndex` sorts edges by `from` (stably, so input order is
+preserved within each vertex).
+
+### Opening a graph
+
+```typescript
+import { FlatGeoGraphBuf } from 'flatgeographbuf/geojson';
+
+const fgg = await FlatGeoGraphBuf.open(bytes);
+// fgg.featureCount, fgg.layout.header.edgeCount, etc.
+```
+
+`FlatGeoGraphBuf.open()` is async, lightweight (parses the header and
+locates the optional indices in O(1) reads), and accepts either a
+`Uint8Array` or any `ByteReader`. Reuse the returned instance across
+many queries — every method caches what it reads.
+
+### Iterating features
+
+```typescript
+for await (const f of fgg.features()) { … }
+const v0 = await fgg.getFeature(0);                          // lazy + cached
+for await (const f of fgg.featuresInBbox({ minX, minY, maxX, maxY })) { … }
+```
+
+`featuresInBbox` requires `writeIndex: true` (the default).
+
+### Outgoing edges of a vertex (`fgg.outgoingEdgesOf`)
+
+Requires `writeAdjacencyIndex: true` (the default).
+
+```typescript
+for await (const edge of fgg.outgoingEdgesOf(42)) {
+    console.log(`-> ${edge.to}`, edge.properties);
+}
+```
+
+The async generator yields all edges whose `from === 42`, in the order
+they were written (stable sort). Repeated calls on the same vertex
+serve from cache.
+
+### All edges (`fgg.allEdges`)
+
+```typescript
+for await (const edge of fgg.allEdges()) {
+    process(edge);
+}
+```
+
+### Edges intersecting a bounding box (`fgg.edgesInBbox`)
+
+Requires `writeEdgeIndex: true` (the default).
+
+```typescript
+for await (const edge of fgg.edgesInBbox({
+    minX: -46.65, minY: -23.55,
+    maxX: -46.55, maxY: -23.45,
+})) {
+    console.log(edge.from, '->', edge.to, edge.properties);
+}
+```
+
+### Eager-loading and releasing the cache
+
+For small / medium graphs that fit in memory, you can warm the cache up-
+front with a single bulk transfer (a single HTTP request when the
+ByteReader implements `readAll`):
+
+```typescript
+await fgg.preload();    // features + edges + R-trees, one round trip
+// every subsequent query is now zero-I/O
+
+fgg.release();          // drop every cache, future queries hit the source again
+```
+
+Finer-grained variants exist: `loadFeatures`, `loadEdges`, `loadIndices`,
+`releaseFeatures`, `releaseEdges`, `releaseIndices`. `loadIndices()` is
+particularly useful on large remote files: it caches only the R-trees
+so spatial traversal is local while feature/edge payloads stay lazy.
+
+### Custom `ByteReader` for remote / file / mmap sources
+
+```typescript
+import type { ByteReader } from 'flatgeographbuf/geojson';
+
+// Browser / Node 18+ / React Native via fetch
+const url: ByteReader = {
+    async read(offset, length) {
+        const r = await fetch('https://example.com/network.fgg', {
+            headers: { Range: `bytes=${offset}-${offset + length - 1}` },
+        });
+        return new Uint8Array(await r.arrayBuffer());
+    },
+    async readAll() {
+        const r = await fetch('https://example.com/network.fgg');
+        return new Uint8Array(await r.arrayBuffer());
+    },
+};
+const fgg = await FlatGeoGraphBuf.open(url);
+```
+
+Implementing `readAll()` is optional; when present, `preload()` uses
+it for a single round-trip transfer. For convenience the library
+ships `byteReaderFromUint8Array(bytes)` and
+`byteReaderFromUrl(url, { headers, nocache })` so the snippet above
+collapses to `FlatGeoGraphBuf.open(byteReaderFromUrl(url))`.
+
+The R-tree uses standard bbox-intersection semantics, so edges that
+*partially* overlap the query rectangle (e.g. a LineString that exits
+the rectangle) are returned in full. Exact LineString-vs-rectangle
+testing is the caller's responsibility.
+
+Edge bounding boxes always include the `from` and `to` vertex
+positions even when the LineString geometry doesn't start/end exactly
+on them — queries near a vertex will catch every edge incident to it.
+
+## Shortest Path (Dijkstra / A*)
+
+`shortestPath` traverses the graph using A* by default, with a
+straight-line haversine heuristic that is admissible for geospatial
+graphs. Pass `heuristic: null` to fall back to plain Dijkstra.
+
+Requires `writeAdjacencyIndex: true` so neighbour lookup is O(deg(v)).
+
+### Simplest call — A* with haversine, weight = geodesic distance
+
+```typescript
+import { shortestPath } from 'flatgeographbuf/geojson';
+
+const result = await shortestPath(bytes, 0, 5);
+if (result) {
+    console.log(`Cost (metres): ${result.cost}`);
+    console.log('Vertices on the path:', result.vertices.map((v) => v.properties.id));
+    console.log('Edges on the path:', result.edges.length);
+}
+```
+
+The return type is:
+
+```typescript
+interface ShortestPathResult {
+    vertices: IGeoJsonFeature[]; // path nodes from `from` to `to`
+    edges: Edge[];               // edges traversed, in order
+    cost: number;                // sum of weights along the path
+}
+```
+
+`shortestPath` returns `null` when no path exists, and a trivial
+single-vertex / zero-edge result when `from === to`.
+
+### Custom edge weight
+
+`weight(distance, properties)` receives the precomputed haversine
+length of the edge (in metres, following the LineString geometry when
+present) and the edge's properties. Return any non-negative finite
+number — units are entirely yours.
+
+```typescript
+// Travel time in seconds: distance / (speed_kmh / 3.6)
+const fastest = await shortestPath(bytes, src, dst, {
+    weight: (distance, props) => {
+        const speedKmh = Number(props.speed_kmh ?? 50);
+        return distance / (speedKmh / 3.6);
+    },
+});
+
+// Discrete hop count
+const hops = await shortestPath(bytes, src, dst, { weight: () => 1 });
+```
+
+> **Admissibility note.** The default haversine heuristic is only
+> admissible when `weight(d, …) ≤ d`. If your weight is in arbitrary
+> units (travel time, hop count, monetary cost, …) the default
+> heuristic can overestimate and A* may return a suboptimal path.
+> Either pass `heuristic: null` (Dijkstra) or supply your own
+> admissible heuristic in the same units as `weight`.
+
+### Choosing the algorithm
+
+```typescript
+// A* with default haversine heuristic
+await shortestPath(bytes, src, dst);
+
+// Plain Dijkstra (no heuristic)
+await shortestPath(bytes, src, dst, { heuristic: null });
+
+// A* with custom admissible heuristic
+await shortestPath(bytes, src, dst, {
+    heuristic: (vertex, target) => {
+        // Must never overestimate the true remaining cost
+        // and should be in the same units as `weight`.
+        return /* … */ 0;
+    },
+});
+```
+
 ## Metadata Callback
 
 The `deserialize` function accepts an optional callback that provides metadata about both features and graph edges before the full data is parsed.
@@ -292,56 +553,44 @@ async function loadWithProgress(bytes: Uint8Array) {
 }
 ```
 
-## Streaming Large Graphs
+## Random-access queries on large graphs
 
-### Streaming Edge Deserialization
-
-For large graphs, use streaming to avoid loading everything into memory:
+When the graph indices are enabled (the default), open the file as a
+`FlatGeoGraphBuf` instance and use its methods to touch only the data
+you need. `open()` itself reads just the FGG header plus one R-tree
+leaf, so it stays cheap even on very large files.
 
 ```typescript
-import { deserializeStream, deserializeGraphEdges } from 'flatgeographbuf/geojson';
+import { FlatGeoGraphBuf } from 'flatgeographbuf/geojson';
 
-// Stream vertices
-console.log('Processing vertices...');
-for await (const feature of deserializeStream(bytes)) {
-    processVertex(feature);
+const fgg = FlatGeoGraphBuf.open(bytes);
+
+// Walk outgoing edges of a vertex without iterating the full graph
+for (const edge of fgg.outgoingEdgesOf(vertexIdx)) {
+    process(edge);
 }
 
-// Stream edges
-console.log('Processing edges...');
-for await (const edge of deserializeGraphEdges(bytes)) {
-    processEdge(edge);
-}
-
-function processVertex(feature) {
-    // Process one vertex at a time
-    console.log(`Vertex: ${feature.properties.name}`);
-}
-
-function processEdge(edge) {
-    // Process one edge at a time
-    console.log(`Edge: ${edge.from} -> ${edge.to}`);
+// Spatially filter edges by bbox
+for await (const edge of fgg.edgesInBbox({ minX, minY, maxX, maxY })) {
+    process(edge);
 }
 ```
 
 ### Memory-Efficient Processing
 
 ```typescript
-import { deserializeGraphEdges } from 'flatgeographbuf/geojson';
+import { FlatGeoGraphBuf } from 'flatgeographbuf/geojson';
 
-// Calculate total distance without loading all edges
+const fgg = FlatGeoGraphBuf.open(bytes);
+
+// Aggregate distance from a single vertex's outgoing edges
 let totalDistance = 0;
-let edgeCount = 0;
-
-for await (const edge of deserializeGraphEdges(bytes)) {
-    if (edge.properties?.distance) {
+for (const edge of fgg.outgoingEdgesOf(vertexIdx)) {
+    if (typeof edge.properties?.distance === 'number') {
         totalDistance += edge.properties.distance;
     }
-    edgeCount++;
 }
-
-console.log(`Total edges: ${edgeCount}`);
-console.log(`Total distance: ${totalDistance} km`);
+console.log(`Total outgoing distance from vertex ${vertexIdx}: ${totalDistance} km`);
 ```
 
 ## Integration with Graph Libraries

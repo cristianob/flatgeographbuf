@@ -1,5 +1,7 @@
+import * as flatbuffers from 'flatbuffers';
+import type { LineString } from 'geojson';
 import type { ColumnMeta } from './column-meta.js';
-import { SIZE_PREFIX_LEN } from './constants.js';
+import { magicbytes, SIZE_PREFIX_LEN } from './constants.js';
 import { ColumnType } from './flat-geobuf/column-type.js';
 import type {
     AdjacencyList,
@@ -9,6 +11,75 @@ import type {
     EdgeProperties,
     GraphHeaderMeta,
 } from './graph-types.js';
+import type { HeaderMeta } from './header-meta.js';
+import { calcTreeSize, DEFAULT_NODE_SIZE, NODE_ITEM_BYTE_LEN, type Rect } from './packedrtree.js';
+import { buildPackedRTree, envelopeOf, hilbertPermutation, type IndexItem } from './packedrtree-writer.js';
+
+const GRAPH_INDEX_FLAG_ADJACENCY = 0x01;
+const GRAPH_INDEX_FLAG_EDGE_RTREE = 0x02;
+
+/**
+ * Locate the byte offset at which the graph section starts inside `bytes`.
+ *
+ * Strategy:
+ * 1. If the file has a vertex R-tree (`indexNodeSize > 0`) we read **one
+ *    leaf** at the end of the tree to learn the byte offset of the last
+ *    feature, then one size-prefix to learn its length. That is a couple
+ *    of fixed-size reads regardless of how many features the file
+ *    contains — O(1). Files written by this library always store features
+ *    in Hilbert order matching the R-tree leaf order, so the last leaf
+ *    does describe the physical last feature.
+ * 2. Otherwise, fall back to walking each feature's 4-byte size prefix
+ *    (no feature payload is read, so still cheap but O(N)).
+ *
+ * Critically, this function never reads the feature payloads themselves.
+ */
+export function findGraphSectionStart(bytes: Uint8Array, header: HeaderMeta): number {
+    const bb = new flatbuffers.ByteBuffer(bytes);
+    const headerLength = bb.readUint32(magicbytes.length);
+    let offset = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
+
+    if (header.featuresCount === 0) return offset;
+
+    if (header.indexNodeSize > 0) {
+        const treeSize = calcTreeSize(header.featuresCount, header.indexNodeSize);
+        const treeStart = offset;
+        const featuresStart = treeStart + treeSize;
+        if (featuresStart >= bytes.length) return bytes.length;
+
+        const totalNodes = treeSize / NODE_ITEM_BYTE_LEN;
+        const lastLeafPos = treeStart + (totalNodes - 1) * NODE_ITEM_BYTE_LEN;
+        if (lastLeafPos + NODE_ITEM_BYTE_LEN > bytes.length) return bytes.length;
+
+        const leafView = new DataView(bytes.buffer, bytes.byteOffset + lastLeafPos + 32);
+        const lastFeatureRelOffset = Number(leafView.getBigUint64(0, true));
+        const lastFeatureAbsPos = featuresStart + lastFeatureRelOffset;
+        if (lastFeatureAbsPos + SIZE_PREFIX_LEN > bytes.length) return bytes.length;
+
+        const lastFeatureSize = new DataView(bytes.buffer, bytes.byteOffset + lastFeatureAbsPos).getUint32(
+            0,
+            true,
+        );
+        return lastFeatureAbsPos + SIZE_PREFIX_LEN + lastFeatureSize;
+    }
+
+    let read = 0;
+    while (read < header.featuresCount && offset < bytes.length) {
+        const featureLength = bb.readUint32(offset);
+        offset += SIZE_PREFIX_LEN + featureLength;
+        read++;
+    }
+    return offset;
+}
+
+export interface BuildGraphSectionOptions {
+    writeAdjacencyIndex?: boolean;
+    writeEdgeIndex?: boolean;
+    /** Vertex bounding boxes, indexed by feature index. Required when
+     * `writeEdgeIndex` is true so edges with null geometry can still be
+     * placed in the R-tree using their endpoints' positions. */
+    vertexBboxes?: Rect[];
+}
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -41,9 +112,9 @@ function introspectEdgeColumns(edges: EdgeInput[]): ColumnMeta[] | null {
     }));
 }
 
-function buildGraphHeader(edgeCount: number, edgeColumns: ColumnMeta[] | null): Uint8Array {
+function buildGraphHeader(edgeCount: number, edgeColumns: ColumnMeta[] | null, indexFlags: number): Uint8Array {
     const columnCount = edgeColumns?.length ?? 0;
-    let size = 4 + 2;
+    let size = 4 + 2 + 1; // edgeCount + columnCount + indexFlags
 
     const columnBuffers: Uint8Array[] = [];
     if (edgeColumns) {
@@ -75,6 +146,7 @@ function buildGraphHeader(edgeCount: number, edgeColumns: ColumnMeta[] | null): 
         offset += colBuffer.length;
     }
 
+    result[offset] = indexFlags & 0xff;
     return result;
 }
 
@@ -183,6 +255,38 @@ function encodeEdgeProperties(properties: EdgeProperties | undefined, columns: C
     return bytes.slice(0, offset);
 }
 
+function validateEdgeGeometry(geometry: LineString | null | undefined): LineString | null {
+    if (!geometry) return null;
+    if (geometry.type !== 'LineString') {
+        throw new Error(`Edge geometry must be LineString, got: ${(geometry as { type: string }).type}`);
+    }
+    if (!Array.isArray(geometry.coordinates) || geometry.coordinates.length < 2) {
+        throw new Error('Edge LineString must have at least 2 coordinates');
+    }
+    return geometry;
+}
+
+function encodeEdgeGeometry(geometry: LineString | null): Uint8Array {
+    if (!geometry) {
+        const buf = new Uint8Array(4);
+        return buf;
+    }
+    const coords = geometry.coordinates;
+    const pointCount = coords.length;
+    const buf = new Uint8Array(4 + pointCount * 16);
+    const view = new DataView(buf.buffer);
+    view.setUint32(0, pointCount, true);
+    let offset = 4;
+    for (let i = 0; i < pointCount; i++) {
+        const c = coords[i];
+        view.setFloat64(offset, c[0], true);
+        offset += 8;
+        view.setFloat64(offset, c[1], true);
+        offset += 8;
+    }
+    return buf;
+}
+
 function buildEdgeRecord(edge: EdgeInput, columns: ColumnMeta[] | null, featureCount: number): Uint8Array {
     if (edge.from < 0 || edge.from >= featureCount) {
         throw new Error(`Invalid 'from' index: ${edge.from}. Must be between 0 and ${featureCount - 1}`);
@@ -194,27 +298,155 @@ function buildEdgeRecord(edge: EdgeInput, columns: ColumnMeta[] | null, featureC
         throw new Error(`Self-loops are not allowed: from=${edge.from}, to=${edge.to}`);
     }
 
+    const geometry = validateEdgeGeometry(edge.geometry);
+    const geomBytes = encodeEdgeGeometry(geometry);
     const propsBytes = encodeEdgeProperties(edge.properties, columns);
-    const size = 8 + propsBytes.length;
+    const size = 8 + geomBytes.length + propsBytes.length;
     const result = new Uint8Array(SIZE_PREFIX_LEN + size);
     const view = new DataView(result.buffer);
 
     view.setUint32(0, size, true);
     view.setUint32(4, edge.from, true);
     view.setUint32(8, edge.to, true);
-    result.set(propsBytes, 12);
+    result.set(geomBytes, 12);
+    result.set(propsBytes, 12 + geomBytes.length);
 
     return result;
 }
 
-export function buildGraphSection(adjacencyList: AdjacencyListInput, featureCount: number): Uint8Array {
-    const edgeColumns = introspectEdgeColumns(adjacencyList.edges);
-    const graphHeader = buildGraphHeader(adjacencyList.edges.length, edgeColumns);
+function edgeBbox(edge: EdgeInput, vertexBboxes: Rect[] | undefined): Rect {
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
 
-    const edgeBuffers = adjacencyList.edges.map((edge) => buildEdgeRecord(edge, edgeColumns, featureCount));
-    const edgesLength = edgeBuffers.reduce((sum, e) => sum + e.length, 0);
+    if (edge.geometry && edge.geometry.coordinates.length > 0) {
+        for (const c of edge.geometry.coordinates) {
+            if (c[0] < minX) minX = c[0];
+            if (c[1] < minY) minY = c[1];
+            if (c[0] > maxX) maxX = c[0];
+            if (c[1] > maxY) maxY = c[1];
+        }
+    }
+    if (vertexBboxes) {
+        const fb = vertexBboxes[edge.from];
+        const tb = vertexBboxes[edge.to];
+        if (fb.minX < minX) minX = fb.minX;
+        if (fb.minY < minY) minY = fb.minY;
+        if (fb.maxX > maxX) maxX = fb.maxX;
+        if (fb.maxY > maxY) maxY = fb.maxY;
+        if (tb.minX < minX) minX = tb.minX;
+        if (tb.minY < minY) minY = tb.minY;
+        if (tb.maxX > maxX) maxX = tb.maxX;
+        if (tb.maxY > maxY) maxY = tb.maxY;
+    }
 
-    const totalLength = SIZE_PREFIX_LEN + graphHeader.length + edgesLength;
+    if (!Number.isFinite(minX)) {
+        throw new Error(
+            'Cannot compute edge bbox: edge has no geometry and vertex bboxes were not provided. ' +
+                'Pass `vertexBboxes` when enabling writeEdgeIndex.',
+        );
+    }
+    return { minX, minY, maxX, maxY };
+}
+
+function buildAdjacencyBlock(
+    sortedEdges: EdgeInput[],
+    edgeLengths: number[],
+    featureCount: number,
+): Uint8Array {
+    const numOffsets = featureCount + 1;
+    const blockBytes = 4 * numOffsets;
+    const buf = new Uint8Array(SIZE_PREFIX_LEN + blockBytes);
+    const view = new DataView(buf.buffer);
+    view.setUint32(0, blockBytes, true);
+
+    // Cumulative sum: offsets[v] = byte offset of v's first outgoing edge
+    // in the edges section; offsets[N] = total edges length.
+    const offsets = new Uint32Array(numOffsets);
+    let cursor = 0;
+    let edgeIdx = 0;
+    for (let v = 0; v < featureCount; v++) {
+        offsets[v] = cursor;
+        while (edgeIdx < sortedEdges.length && sortedEdges[edgeIdx].from === v) {
+            cursor += edgeLengths[edgeIdx];
+            edgeIdx++;
+        }
+    }
+    offsets[featureCount] = cursor;
+
+    for (let v = 0; v <= featureCount; v++) {
+        view.setUint32(SIZE_PREFIX_LEN + v * 4, offsets[v], true);
+    }
+    return buf;
+}
+
+function buildEdgeRTreeBlock(
+    edges: EdgeInput[],
+    edgeByteOffsets: number[],
+    vertexBboxes: Rect[] | undefined,
+): Uint8Array {
+    const bboxes = edges.map((e) => edgeBbox(e, vertexBboxes));
+    const envelope = envelopeOf(bboxes);
+    const perm = hilbertPermutation(bboxes, envelope);
+    const items: IndexItem[] = perm.map((oldIdx) => ({
+        ...bboxes[oldIdx],
+        offset: edgeByteOffsets[oldIdx],
+    }));
+    const rtreeBytes = buildPackedRTree(items, DEFAULT_NODE_SIZE);
+
+    const buf = new Uint8Array(SIZE_PREFIX_LEN + rtreeBytes.length);
+    new DataView(buf.buffer).setUint32(0, rtreeBytes.length, true);
+    buf.set(rtreeBytes, SIZE_PREFIX_LEN);
+    return buf;
+}
+
+export function buildGraphSection(
+    adjacencyList: AdjacencyListInput,
+    featureCount: number,
+    options: BuildGraphSectionOptions = {},
+): Uint8Array {
+    const writeAdj = !!options.writeAdjacencyIndex;
+    const writeRTree = !!options.writeEdgeIndex;
+
+    // When the adjacency index is requested, edges MUST be physically
+    // ordered by `from` so the CSR offsets describe contiguous spans.
+    // Array.prototype.sort is stable in modern JS engines.
+    const orderedEdges = writeAdj ? [...adjacencyList.edges].sort((a, b) => a.from - b.from) : adjacencyList.edges;
+
+    const edgeColumns = introspectEdgeColumns(orderedEdges);
+
+    const edgeBuffers = orderedEdges.map((edge) => buildEdgeRecord(edge, edgeColumns, featureCount));
+    const edgeLengths = edgeBuffers.map((b) => b.length);
+    const edgesLength = edgeLengths.reduce((sum, l) => sum + l, 0);
+
+    let cursor = 0;
+    const edgeByteOffsets: number[] = new Array(orderedEdges.length);
+    for (let i = 0; i < orderedEdges.length; i++) {
+        edgeByteOffsets[i] = cursor;
+        cursor += edgeLengths[i];
+    }
+
+    let indexFlags = 0;
+    let adjBlock: Uint8Array | null = null;
+    if (writeAdj) {
+        indexFlags |= GRAPH_INDEX_FLAG_ADJACENCY;
+        adjBlock = buildAdjacencyBlock(orderedEdges, edgeLengths, featureCount);
+    }
+    let rtreeBlock: Uint8Array | null = null;
+    if (writeRTree && orderedEdges.length > 0) {
+        indexFlags |= GRAPH_INDEX_FLAG_EDGE_RTREE;
+        rtreeBlock = buildEdgeRTreeBlock(orderedEdges, edgeByteOffsets, options.vertexBboxes);
+    }
+
+    const graphHeader = buildGraphHeader(orderedEdges.length, edgeColumns, indexFlags);
+
+    const totalLength =
+        SIZE_PREFIX_LEN +
+        graphHeader.length +
+        (adjBlock?.length ?? 0) +
+        (rtreeBlock?.length ?? 0) +
+        edgesLength;
     const result = new Uint8Array(totalLength);
     let offset = 0;
 
@@ -224,6 +456,15 @@ export function buildGraphSection(adjacencyList: AdjacencyListInput, featureCoun
     result.set(graphHeader, offset);
     offset += graphHeader.length;
 
+    if (adjBlock) {
+        result.set(adjBlock, offset);
+        offset += adjBlock.length;
+    }
+    if (rtreeBlock) {
+        result.set(rtreeBlock, offset);
+        offset += rtreeBlock.length;
+    }
+
     for (const edgeBuffer of edgeBuffers) {
         result.set(edgeBuffer, offset);
         offset += edgeBuffer.length;
@@ -232,7 +473,7 @@ export function buildGraphSection(adjacencyList: AdjacencyListInput, featureCoun
     return result;
 }
 
-function parseGraphHeader(bytes: Uint8Array, offset: number, _headerSize: number): GraphHeaderMeta {
+function parseGraphHeader(bytes: Uint8Array, offset: number): GraphHeaderMeta {
     const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
     let pos = 0;
 
@@ -268,9 +509,13 @@ function parseGraphHeader(bytes: Uint8Array, offset: number, _headerSize: number
         });
     }
 
+    const indexFlags = bytes[offset + pos];
+
     return {
         edgeCount,
         edgeColumns: edgeColumns.length > 0 ? edgeColumns : null,
+        hasAdjacencyIndex: (indexFlags & GRAPH_INDEX_FLAG_ADJACENCY) !== 0,
+        hasEdgeIndex: (indexFlags & GRAPH_INDEX_FLAG_EDGE_RTREE) !== 0,
     };
 }
 
@@ -364,40 +609,102 @@ function parseEdgeProperties(bytes: Uint8Array, columns: ColumnMeta[] | null): E
     return properties;
 }
 
+function parseEdgeGeometry(bytes: Uint8Array, offset: number): { geometry: LineString | null; consumed: number } {
+    const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
+    const pointCount = view.getUint32(0, true);
+    if (pointCount === 0) {
+        return { geometry: null, consumed: 4 };
+    }
+    const coordinates: number[][] = new Array(pointCount);
+    let pos = 4;
+    for (let i = 0; i < pointCount; i++) {
+        const x = view.getFloat64(pos, true);
+        pos += 8;
+        const y = view.getFloat64(pos, true);
+        pos += 8;
+        coordinates[i] = [x, y];
+    }
+    return {
+        geometry: { type: 'LineString', coordinates },
+        consumed: pos,
+    };
+}
+
 function parseEdge(bytes: Uint8Array, offset: number, size: number, columns: ColumnMeta[] | null): Edge {
     const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
 
     const from = view.getUint32(0, true);
     const to = view.getUint32(4, true);
 
+    const { geometry, consumed } = parseEdgeGeometry(bytes, offset + 8);
+    const propsStart = 8 + consumed;
+
     let properties: EdgeProperties = {};
-    if (columns && columns.length > 0 && size > 8) {
-        const propsBytes = bytes.subarray(offset + 8, offset + size);
+    if (columns && columns.length > 0 && size > propsStart) {
+        const propsBytes = bytes.subarray(offset + propsStart, offset + size);
         properties = parseEdgeProperties(propsBytes, columns);
     }
 
-    return { from, to, properties };
+    return { from, to, geometry, properties };
 }
 
-export function parseGraphSectionHeader(bytes: Uint8Array, offset: number): GraphHeaderMeta {
+/**
+ * Layout of the graph section, expressed in absolute byte offsets within
+ * the FGG file. Useful for random access (CSR adjacency, edge R-tree).
+ */
+export interface GraphSectionLayout {
+    header: GraphHeaderMeta;
+    adjacencyOffsetsStart: number | null;
+    adjacencyOffsetsBytes: number;
+    edgeRTreeStart: number | null;
+    edgeRTreeBytes: number;
+    edgesStart: number;
+}
+
+export function parseGraphSectionLayout(bytes: Uint8Array, offset: number): GraphSectionLayout {
     const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
     const headerSize = view.getUint32(0, true);
-    return parseGraphHeader(bytes, offset + SIZE_PREFIX_LEN, headerSize);
+    const header = parseGraphHeader(bytes, offset + SIZE_PREFIX_LEN);
+    let cursor = offset + SIZE_PREFIX_LEN + headerSize;
+
+    let adjacencyOffsetsStart: number | null = null;
+    let adjacencyOffsetsBytes = 0;
+    if (header.hasAdjacencyIndex) {
+        const blockSize = new DataView(bytes.buffer, bytes.byteOffset + cursor).getUint32(0, true);
+        adjacencyOffsetsStart = cursor + SIZE_PREFIX_LEN;
+        adjacencyOffsetsBytes = blockSize;
+        cursor += SIZE_PREFIX_LEN + blockSize;
+    }
+
+    let edgeRTreeStart: number | null = null;
+    let edgeRTreeBytes = 0;
+    if (header.hasEdgeIndex) {
+        const blockSize = new DataView(bytes.buffer, bytes.byteOffset + cursor).getUint32(0, true);
+        edgeRTreeStart = cursor + SIZE_PREFIX_LEN;
+        edgeRTreeBytes = blockSize;
+        cursor += SIZE_PREFIX_LEN + blockSize;
+    }
+
+    return {
+        header,
+        adjacencyOffsetsStart,
+        adjacencyOffsetsBytes,
+        edgeRTreeStart,
+        edgeRTreeBytes,
+        edgesStart: cursor,
+    };
 }
 
 export function parseGraphSection(bytes: Uint8Array, offset: number): AdjacencyList {
-    const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
-    const headerSize = view.getUint32(0, true);
-    offset += SIZE_PREFIX_LEN;
+    const layout = parseGraphSectionLayout(bytes, offset);
+    const { edgeCount, edgeColumns } = layout.header;
 
-    const { edgeCount, edgeColumns } = parseGraphHeader(bytes, offset, headerSize);
-    offset += headerSize;
-
+    let cursor = layout.edgesStart;
     const edges: Edge[] = new Array(edgeCount);
     for (let i = 0; i < edgeCount; i++) {
-        const edgeSize = new DataView(bytes.buffer, bytes.byteOffset + offset).getUint32(0, true);
-        edges[i] = parseEdge(bytes, offset + SIZE_PREFIX_LEN, edgeSize, edgeColumns);
-        offset += SIZE_PREFIX_LEN + edgeSize;
+        const edgeSize = new DataView(bytes.buffer, bytes.byteOffset + cursor).getUint32(0, true);
+        edges[i] = parseEdge(bytes, cursor + SIZE_PREFIX_LEN, edgeSize, edgeColumns);
+        cursor += SIZE_PREFIX_LEN + edgeSize;
     }
 
     return { edges };
@@ -407,18 +714,14 @@ export async function* deserializeGraphStream(
     bytes: Uint8Array,
     graphOffset: number,
 ): AsyncGenerator<Edge, void, unknown> {
-    let offset = graphOffset;
-
-    const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
-    const headerSize = view.getUint32(0, true);
-    offset += SIZE_PREFIX_LEN;
-
-    const { edgeCount, edgeColumns } = parseGraphHeader(bytes, offset, headerSize);
-    offset += headerSize;
-
+    const layout = parseGraphSectionLayout(bytes, graphOffset);
+    const { edgeCount, edgeColumns } = layout.header;
+    let cursor = layout.edgesStart;
     for (let i = 0; i < edgeCount; i++) {
-        const edgeSize = new DataView(bytes.buffer, bytes.byteOffset + offset).getUint32(0, true);
-        yield parseEdge(bytes, offset + SIZE_PREFIX_LEN, edgeSize, edgeColumns);
-        offset += SIZE_PREFIX_LEN + edgeSize;
+        const edgeSize = new DataView(bytes.buffer, bytes.byteOffset + cursor).getUint32(0, true);
+        yield parseEdge(bytes, cursor + SIZE_PREFIX_LEN, edgeSize, edgeColumns);
+        cursor += SIZE_PREFIX_LEN + edgeSize;
     }
 }
+
+export { parseEdge };

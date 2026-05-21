@@ -2,6 +2,10 @@ node_modules
 target
 yarn-error.log
 package-lock.json
+playwright-report
+test-results
+/playwright/.cache
+*.tgz
 /src/c/include/flatcc
 /src/cpp/include/flatbuffers
 /src/cpp/include/mapbox

@@ -1,6 +1,7 @@
 import * as flatbuffers from 'flatbuffers';
 import type {
     FeatureCollection as GeoJsonFeatureCollection,
+    Geometry as GeoJsonGeometry,
     GeometryCollection,
     LineString,
     MultiLineString,
@@ -10,8 +11,7 @@ import type {
     Polygon,
 } from 'geojson';
 import type { ColumnMeta } from '../column-meta.js';
-import { magicbytes, SIZE_PREFIX_LEN } from '../constants.js';
-import { Feature } from '../flat-geobuf/feature.js';
+import { magicbytes } from '../constants.js';
 import { buildFeature, type IFeature, type IProperties } from '../generic/feature.js';
 import {
     buildHeader,
@@ -22,29 +22,162 @@ import {
 } from '../generic/featurecollection.js';
 import { inferGeometryType } from '../generic/header.js';
 import type { HeaderMetaFn } from '../generic.js';
-import { buildGraphSection, deserializeGraphStream, parseGraphSection, parseGraphSectionHeader } from '../graph.js';
+import {
+    buildGraphSection,
+    deserializeGraphStream,
+    findGraphSectionStart,
+    parseGraphSection,
+    parseGraphSectionLayout,
+} from '../graph.js';
 import type {
     AdjacencyList,
     AdjacencyListInput,
     DeserializeGraphResult,
     Edge,
+    EdgeInput,
     FlatGeoGraphBufMeta,
     FlatGeoGraphBufMetaFn,
 } from '../graph-types.js';
 import type { HeaderMeta } from '../header-meta.js';
 import { fromByteBuffer } from '../header-meta.js';
-import { calcTreeSize, type Rect } from '../packedrtree.js';
+import { DEFAULT_NODE_SIZE, type Rect } from '../packedrtree.js';
+import { buildPackedRTree, envelopeOf, hilbertPermutation, type IndexItem } from '../packedrtree-writer.js';
 import { fromFeature, type IGeoJsonFeature } from './feature.js';
 import { parseGC, parseGeometry } from './geometry.js';
+
+export interface SerializeOptions {
+    /** EPSG code for the dataset CRS (default: `4326`, WGS84). */
+    crsCode?: number;
+    /**
+     * Write a packed Hilbert R-tree spatial index over vertices between
+     * the header and the features section (default: `true`). Reorders
+     * features along the Hilbert curve and remaps edge `from` / `to`
+     * accordingly.
+     */
+    writeIndex?: boolean;
+    /**
+     * Write a CSR adjacency index in the graph section so neighbor
+     * lookup (`outgoingEdgesOf(v)`) is O(deg(v)). Required for
+     * `shortestPath`. Causes edges to be physically sorted by `from`.
+     * Default: `true` (ignored when there is no adjacencyList).
+     */
+    writeAdjacencyIndex?: boolean;
+    /**
+     * Write a packed Hilbert R-tree spatial index over edges in the
+     * graph section so `edgesInBbox(rect)` can locate intersecting
+     * edges without scanning the whole graph. Default: `true` (ignored
+     * when there is no adjacencyList).
+     */
+    writeEdgeIndex?: boolean;
+}
+
+interface NormalizedOptions {
+    crsCode: number;
+    writeIndex: boolean;
+    writeAdjacencyIndex: boolean;
+    writeEdgeIndex: boolean;
+}
+
+function normalizeOptions(opts: SerializeOptions | undefined): NormalizedOptions {
+    return {
+        crsCode: opts?.crsCode ?? 4326,
+        writeIndex: opts?.writeIndex ?? true,
+        writeAdjacencyIndex: opts?.writeAdjacencyIndex ?? true,
+        writeEdgeIndex: opts?.writeEdgeIndex ?? true,
+    };
+}
+
+function bboxOf(geom: GeoJsonGeometry): Rect {
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    const visit = (coords: unknown): void => {
+        if (Array.isArray(coords)) {
+            if (typeof coords[0] === 'number') {
+                const x = coords[0] as number;
+                const y = coords[1] as number;
+                if (x < minX) minX = x;
+                if (y < minY) minY = y;
+                if (x > maxX) maxX = x;
+                if (y > maxY) maxY = y;
+            } else {
+                for (const c of coords) visit(c);
+            }
+        }
+    };
+
+    if (geom.type === 'GeometryCollection') {
+        for (const g of (geom as GeometryCollection).geometries) {
+            const r = bboxOf(g);
+            if (r.minX < minX) minX = r.minX;
+            if (r.minY < minY) minY = r.minY;
+            if (r.maxX > maxX) maxX = r.maxX;
+            if (r.maxY > maxY) maxY = r.maxY;
+        }
+    } else {
+        visit((geom as { coordinates: unknown }).coordinates);
+    }
+
+    return { minX, minY, maxX, maxY };
+}
+
+function remapEdges(adjacencyList: AdjacencyListInput, invPerm: number[]): AdjacencyListInput {
+    const edges: EdgeInput[] = adjacencyList.edges.map((e) => ({
+        ...e,
+        from: invPerm[e.from],
+        to: invPerm[e.to],
+    }));
+    return { edges };
+}
 
 export function serialize(
     featurecollection: GeoJsonFeatureCollection,
     adjacencyList?: AdjacencyListInput,
-    crsCode = 0,
+    options?: SerializeOptions,
 ): Uint8Array {
+    const { crsCode, writeIndex, writeAdjacencyIndex, writeEdgeIndex } = normalizeOptions(options);
+    // Edge-related index flags only make sense with a graph section.
+    const effectiveAdjacencyIndex = writeAdjacencyIndex && adjacencyList !== undefined;
+    const effectiveEdgeIndex = writeEdgeIndex && adjacencyList !== undefined;
+
     const headerMeta = introspectHeaderMeta(featurecollection);
+    const featureCount = featurecollection.features.length;
+    const wantsIndex = writeIndex && featureCount > 0;
+    const indexNodeSize = DEFAULT_NODE_SIZE;
+
+    // Bboxes are needed both for the dataset envelope (always written when
+    // we have features) and for the Hilbert sort + R-tree (when indexed).
+    const bboxes: Rect[] = featurecollection.features.map((f) => bboxOf(f.geometry as GeoJsonGeometry));
+    const envelope = featureCount > 0 ? envelopeOf(bboxes) : null;
+
+    let orderedFeatures = featurecollection.features;
+    let orderedBboxes = bboxes;
+    let remappedAdjacency = adjacencyList;
+
+    if (wantsIndex) {
+        // perm[newIdx] = oldIdx; invPerm[oldIdx] = newIdx
+        const perm = hilbertPermutation(bboxes, envelope as Rect);
+        const isIdentity = perm.every((v, i) => v === i);
+        if (!isIdentity) {
+            orderedFeatures = perm.map((oldIdx) => featurecollection.features[oldIdx]);
+            orderedBboxes = perm.map((oldIdx) => bboxes[oldIdx]);
+            if (adjacencyList) {
+                const invPerm = new Array<number>(perm.length);
+                for (let i = 0; i < perm.length; i++) invPerm[perm[i]] = i;
+                remappedAdjacency = remapEdges(adjacencyList, invPerm);
+            }
+        }
+    }
+
+    headerMeta.indexNodeSize = wantsIndex ? indexNodeSize : 0;
+    headerMeta.envelope = envelope
+        ? new Float64Array([envelope.minX, envelope.minY, envelope.maxX, envelope.maxY])
+        : null;
+
     const header = buildHeader(headerMeta, crsCode);
-    const features: Uint8Array[] = featurecollection.features.map((f) =>
+    const featureBuffers: Uint8Array[] = orderedFeatures.map((f) =>
         buildFeature(
             f.geometry.type === 'GeometryCollection'
                 ? parseGC(f.geometry as GeometryCollection)
@@ -55,21 +188,48 @@ export function serialize(
             headerMeta,
         ),
     );
-    const featuresLength = features.map((f) => f.length).reduce((a, b) => a + b, 0);
+    const featuresLength = featureBuffers.reduce((a, b) => a + b.length, 0);
 
-    let graphSection: Uint8Array | null = null;
-    if (adjacencyList) {
-        graphSection = buildGraphSection(adjacencyList, featurecollection.features.length);
+    let indexBytes: Uint8Array | null = null;
+    if (wantsIndex) {
+        const items: IndexItem[] = new Array(featureCount);
+        let runningOffset = 0;
+        for (let i = 0; i < featureCount; i++) {
+            const r = orderedBboxes[i];
+            items[i] = {
+                minX: r.minX,
+                minY: r.minY,
+                maxX: r.maxX,
+                maxY: r.maxY,
+                offset: runningOffset,
+            };
+            runningOffset += featureBuffers[i].length;
+        }
+        indexBytes = buildPackedRTree(items, indexNodeSize);
     }
 
-    const totalLength = magicbytes.length + header.length + featuresLength + (graphSection?.length ?? 0);
+    let graphSection: Uint8Array | null = null;
+    if (remappedAdjacency) {
+        graphSection = buildGraphSection(remappedAdjacency, featureCount, {
+            writeAdjacencyIndex: effectiveAdjacencyIndex,
+            writeEdgeIndex: effectiveEdgeIndex,
+            vertexBboxes: effectiveEdgeIndex ? orderedBboxes : undefined,
+        });
+    }
+
+    const totalLength =
+        magicbytes.length + header.length + (indexBytes?.length ?? 0) + featuresLength + (graphSection?.length ?? 0);
     const uint8 = new Uint8Array(totalLength);
 
     uint8.set(magicbytes);
     uint8.set(header, magicbytes.length);
 
     let offset = magicbytes.length + header.length;
-    for (const feature of features) {
+    if (indexBytes) {
+        uint8.set(indexBytes, offset);
+        offset += indexBytes.length;
+    }
+    for (const feature of featureBuffers) {
         uint8.set(feature, offset);
         offset += feature.length;
     }
@@ -103,25 +263,6 @@ export function deserializeFiltered(
     return genericDeserializeFiltered(url, rect, fromFeature, headerMetaFn, nocache, headers);
 }
 
-function calculateFeaturesEndOffset(bytes: Uint8Array, headerMeta: HeaderMeta): number {
-    const bb = new flatbuffers.ByteBuffer(bytes);
-    const headerLength = bb.readUint32(magicbytes.length);
-    let offset = magicbytes.length + SIZE_PREFIX_LEN + headerLength;
-
-    if (headerMeta.indexNodeSize > 0) {
-        offset += calcTreeSize(headerMeta.featuresCount, headerMeta.indexNodeSize);
-    }
-
-    let featuresRead = 0;
-    while (featuresRead < headerMeta.featuresCount && offset < bytes.length) {
-        const featureLength = bb.readUint32(offset);
-        offset += SIZE_PREFIX_LEN + featureLength;
-        featuresRead++;
-    }
-
-    return offset;
-}
-
 export async function deserialize(
     bytes: Uint8Array,
     metaFn?: FlatGeoGraphBufMetaFn,
@@ -132,10 +273,10 @@ export async function deserialize(
     bb.setPosition(magicbytes.length);
     const headerMeta = fromByteBuffer(bb);
 
-    const featuresEndOffset = calculateFeaturesEndOffset(bytes, headerMeta);
+    const featuresEndOffset = findGraphSectionStart(bytes, headerMeta);
     const hasGraphSection = featuresEndOffset < bytes.length;
 
-    const graphMeta = hasGraphSection ? parseGraphSectionHeader(bytes, featuresEndOffset) : null;
+    const graphMeta = hasGraphSection ? parseGraphSectionLayout(bytes, featuresEndOffset).header : null;
 
     if (metaFn) {
         const combinedMeta: FlatGeoGraphBufMeta = {
@@ -159,7 +300,7 @@ export async function* deserializeGraphEdges(bytes: Uint8Array): AsyncGenerator<
     bb.setPosition(magicbytes.length);
     const headerMeta = fromByteBuffer(bb);
 
-    const featuresEndOffset = calculateFeaturesEndOffset(bytes, headerMeta);
+    const featuresEndOffset = findGraphSectionStart(bytes, headerMeta);
 
     if (featuresEndOffset >= bytes.length) return;
 
